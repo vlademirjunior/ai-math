@@ -44,12 +44,7 @@ def test_manual_role_runs_single_shot_for_non_implementer(monkeypatch, tmp_path:
         on_chunk=None,
     )
 
-<<<<<<< HEAD
     assert artifacts == []
-=======
-    assert len(artifacts) == 1
-    assert artifacts[0].exists()
->>>>>>> 63c39ec (ok)
 
 
 def test_should_trigger_pipeline_for_greeting_is_false() -> None:
