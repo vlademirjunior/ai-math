@@ -1,0 +1,13 @@
+{
+	"servers": {
+		"io.github.github/github-mcp-server": {
+			"url": "https://api.githubcopilot.com/mcp/",
+			"type": "http"
+		},
+        "Docs by LangChain": {
+			"url": "https://docs.langchain.com/mcp",
+			"type": "http"
+		}
+	},
+	"inputs": []
+}

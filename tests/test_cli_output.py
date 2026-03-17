@@ -2,6 +2,7 @@
 
 import main
 from main import (
+    DUMP_EVENT_PREFIX,
     IMPLEMENTER_DONE_TOKEN,
     STATUS_EVENT_PREFIX,
     AgentRuntime,
@@ -34,9 +35,26 @@ def test_output_handler_hides_intermediate_logs_when_not_verbose(monkeypatch) ->
     handler = build_output_handler(verbose=False)
     handler("plain-stream-log")
     handler(f"{STATUS_EVENT_PREFIX}=== Planner ===")
+    handler(f"{DUMP_EVENT_PREFIX}{{'messages': []}}")
 
     assert "plain-stream-log" not in "\n".join(printed)
+    assert "messages" not in "\n".join(printed)
     assert any("Planner" in item for item in printed)
+
+
+def test_output_handler_shows_dump_when_verbose(monkeypatch) -> None:
+    printed: list[str] = []
+
+    def fake_print(*args, **kwargs) -> None:
+        if args:
+            printed.append(str(args[0]))
+
+    monkeypatch.setattr(main.console, "print", fake_print)
+
+    handler = build_output_handler(verbose=True)
+    handler(f"{DUMP_EVENT_PREFIX}{{'messages': []}}")
+
+    assert any("messages" in item for item in printed)
 
 
 def test_run_pipeline_emits_phase_status_events(monkeypatch, tmp_path: Path) -> None:

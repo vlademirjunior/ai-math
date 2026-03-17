@@ -37,9 +37,11 @@ app = typer.Typer(help="Helo CLI (AI)", no_args_is_help=True)
 IMPLEMENTER_STOP_TOKEN = "STOP_FOR_COMMIT"
 IMPLEMENTER_DONE_TOKEN = "IMPLEMENTATION_COMPLETE"
 STATUS_EVENT_PREFIX = "__STATUS__::"
+DUMP_EVENT_PREFIX = "__DUMP__::"
 META_CONTEXT_WINDOW_FALLBACK = 128_000
 MAX_CONTEXT_FILE_CHARS = 12_000
 MAX_DIRECTORY_CONTEXT_ITEMS = 60
+MAX_VERBOSE_DUMP_CHARS = 4_000
 EXIT_COMMANDS = {"exit", "quit", "/exit"}
 CHAT_COMMANDS = {"/planner", "/generator", "/implementer", "/clear", "/reset", "/help", "/exit"}
 ROLE_COMMANDS = {"/planner", "/generator", "/implementer"}
@@ -870,6 +872,17 @@ class AgentRuntime:
                 return text
         return ""
 
+    @staticmethod
+    def _chunk_to_debug_dump(chunk: Any) -> str:
+        try:
+            rendered = repr(chunk)
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            rendered = f"<unrepresentable chunk: {exc}>"
+
+        if len(rendered) > MAX_VERBOSE_DUMP_CHARS:
+            return f"{rendered[:MAX_VERBOSE_DUMP_CHARS]} ...(truncated)"
+        return rendered
+
     def create_role_agent(self, role: ModelRole, auto: bool = False) -> Any:
         role_model = self.model_factory.create(role)
         kwargs: dict[str, Any] = {
@@ -932,6 +945,8 @@ class AgentRuntime:
         chunks = self.stream_role(role=role, prompt=prompt, thread_id=thread_id, auto=auto)
         output_parts: list[str] = []
         for chunk in chunks:
+            if on_chunk:
+                on_chunk(f"{DUMP_EVENT_PREFIX}{self._chunk_to_debug_dump(chunk)}")
             text = self._chunk_to_text(chunk)
             output_parts.append(text)
             if on_chunk:
@@ -1100,6 +1115,8 @@ class AgentRuntime:
         chunks = self.stream(prompt=prompt, thread_id=thread_id)
         parts: list[str] = []
         for chunk in chunks:
+            if on_chunk:
+                on_chunk(f"{DUMP_EVENT_PREFIX}{self._chunk_to_debug_dump(chunk)}")
             text = self._chunk_to_text(chunk)
             parts.append(text)
             if on_chunk:
@@ -1187,6 +1204,11 @@ def build_output_handler(verbose: bool) -> Callable[[str], None]:
         if text.startswith(STATUS_EVENT_PREFIX):
             message = text[len(STATUS_EVENT_PREFIX) :]
             console.print(f"[bold cyan]{message}[/]")
+            return
+        if text.startswith(DUMP_EVENT_PREFIX):
+            if verbose:
+                dump = text[len(DUMP_EVENT_PREFIX) :]
+                console.print(f"[dim]{dump}[/]")
             return
         if verbose and text:
             console.print(text, end="")
