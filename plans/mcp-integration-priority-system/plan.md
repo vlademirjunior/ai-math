@@ -1,17 +1,17 @@
 # MCP Integration with Priority Context System
 
-**Branch:** mcp-integration-priority-system
-**Description:** Integrate LangChain MCP as a context source with priority ordering, offline handling, and comprehensive testing
+**Branch:** main
+**Description:** Implementa leitura de configurações MCP do arquivo .vscode e integração com servidores disponíveis
 
 ## Goal
-Implement MCP (Model Context Protocol) integration using langchain-mcp-adapters, treating MCP resources as a prioritized context source (after local files and .agents/**), with graceful offline handling, separate context limits, and full test coverage including HTTP server mocking.
+Implementar um sistema que lê o arquivo .vscode/mcp.json e/ou .agents/mcp.json do repositorio atual e configura automaticamente os MCPs (Model Context Protocol) disponíveis, permitindo que o ResizeMe utilize serviços externos como GitHub Copilot e LangChain Docs de forma integrada.
 
 ## Implementation Steps
 
 ### Step 1: Add Dependencies and Configuration
-**Files:** requirements.txt, app/config.py (or main.py if config is inline)
+**Files:** uv add, main.py
 **What:**
-- Add `langchain-mcp-adapters>=0.2.2` to requirements.txt
+- Add `langchain-mcp-adapters>=0.2.2` using uv add command
 - Add new Pydantic config field: `mcp_servers: Dict[str, MCPServerConfig]` with structure:
   ```python
   class MCPServerConfig(BaseModel):
@@ -30,8 +30,9 @@ Implement MCP (Model Context Protocol) integration using langchain-mcp-adapters,
 - Test that MCP config is optional (app works without it)
 
 ### Step 2: Create MCP Client Wrapper with Offline Handling
-**Files:** app/mcp_client.py (new file)
+**Files:** main.py
 **What:**
+- Implementar lógica para ler e parsear o arquivo .vscode/mcp.json e/ou .agents/mcp.json, extraindo informações de servidores e entradas
 - Create `MCPManager` class that:
   - Accepts `AppSettings` instance
   - Maintains `MultiServerMCPClient` instance
@@ -49,9 +50,10 @@ Implement MCP (Model Context Protocol) integration using langchain-mcp-adapters,
 - Unit test: Verify server status tracking (online → offline transitions)
 - Unit test: Verify empty results returned when server offline
 - Unit test: Verify multiple servers, one offline doesn't affect others
+- Testar com o arquivo .vscode/mcp.json e/ou .agents/mcp.json existente e validar parsing correto
 
 ### Step 3: Integrate MCP into Context Building Pipeline
-**Files:** main.py (or app/context_builder.py if extracted)
+**Files:** main.py
 **What:**
 - Modify context building logic to include MCP resources as a source
 - Implement priority order:
@@ -91,7 +93,7 @@ Implement MCP (Model Context Protocol) integration using langchain-mcp-adapters,
 - Test: Verify UI doesn't block execution even with offline servers
 
 ### Step 5: Extend Metadata and Logging
-**Files:** app/models.py or wherever `ChatInteractionMetadata`/`ContextBuildResult` defined
+**Files:** main.py or wherever `ChatInteractionMetadata`/`ContextBuildResult` defined
 **What:**
 - Add fields to `ContextBuildResult`:
   ```python
@@ -144,7 +146,7 @@ Implement MCP (Model Context Protocol) integration using langchain-mcp-adapters,
 - Achieve >80% coverage on MCP-related code
 
 ### Step 7: Documentation and Final Validation
-**Files:** README.md or docs/mcp.md (new), plans/mcp-integration-priority-system/plan.md (this file)
+**Files:** README.md or docs/mcp.md (new), plans/main/plan.md (this file)
 **What:**
 - Create documentation section: "MCP Integration"
   - How to configure MCP servers in config file or environment
@@ -168,7 +170,7 @@ Implement MCP (Model Context Protocol) integration using langchain-mcp-adapters,
 
 ## Notes
 - **Async requirement**: All MCP operations are async. The main pipeline may need async adjustments. Use `asyncio.run()` or convert main loop to async if not already.
-- **Priority system**: Implement as sequential filling: first collect files/.agents up to their limits, then add MCP resources up to `MAX_MCP_CONTEXT_CHARS`.
+- **Priority system**: Implement as sequential filling: first collect local files, .agents/**.md up to their limits, then add MCP resources up to `MAX_MCP_CONTEXT_CHARS`. (context priority)
 - **Offline handling**: Never raise exceptions to user. Log warnings and continue. UI should inform but not block.
 - **Testing focus**: Mock at the `MultiServerMCPClient` level for unit tests, and use `pytest-httpserver` for integration tests to verify HTTP transport.
 - **Performance**: MCP resource fetching may be slow. Consider caching or parallel fetching if needed (future optimization).

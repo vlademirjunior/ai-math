@@ -72,6 +72,96 @@ Importante:
 
 O nome da pasta deve vir da estrategia do planner/skills e nao de criacao manual no runtime.
 
+## MCP Integration
+
+O CLI agora detecta servidores MCP automaticamente a partir destes arquivos do repositorio:
+
+- `.agents/mcp.json`
+- `.vscode/mcp.json`
+
+Tambem e possivel configurar via variaveis de ambiente com nested settings:
+
+```env
+MCP_SERVERS__DOCS__TRANSPORT=streamable_http
+MCP_SERVERS__DOCS__URL=https://docs.langchain.com/mcp
+MCP_SERVERS__DOCS__TIMEOUT=30
+```
+
+Config suportada por servidor:
+
+- `transport`: `stdio`, `streamable_http`, `sse`, `websocket`
+- `command` + `args` para `stdio`
+- `url` + `headers` para transportes de rede
+- `timeout` em segundos
+
+Exemplo `stdio`:
+
+```json
+{
+	"servers": {
+		"local-tools": {
+			"transport": "stdio",
+			"command": "python",
+			"args": ["tools/mcp_server.py"],
+			"timeout": 30
+		}
+	}
+}
+```
+
+Exemplo `streamable_http`:
+
+```json
+{
+	"servers": {
+		"Docs by LangChain": {
+			"transport": "streamable_http",
+			"url": "https://docs.langchain.com/mcp",
+			"timeout": 30
+		}
+	}
+}
+```
+
+Prioridade de contexto aplicada no prompt:
+
+1. Arquivos/pastas referenciados com `#context` (limite `MAX_CONTEXT_FILE_CHARS=12000`)
+2. Skills em `.agents/**/SKILL.md` (mesmo budget do item anterior)
+3. Recursos MCP (limite separado `MAX_MCP_CONTEXT_CHARS=6000`)
+
+### Autenticação de servidores MCP
+
+Alguns servidores MCP (ex: GitHub Copilot) exigem **Autorização (Bearer token)**.
+Se você receber `HTTP 401 Unauthorized`, adicione o cabeçalho `Authorization` no seu `mcp.json`:
+
+```json
+{
+  "servers": {
+    "github": {
+      "transport": "streamable_http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}
+```
+
+Também é possível passar o header via variável de ambiente (exemplo genérico):
+
+```bash
+export MCP_SERVERS__github__HEADERS__Authorization="Bearer YOUR_TOKEN_HERE"
+```
+
+Mensagens de status MCP:
+
+- `✓ MCP servers: ...` quando ha servidores online
+- `⚠ MCP servers: ... (offline)` quando parte dos servidores esta indisponivel
+- `[MCP] All MCP servers offline - skipping MCP context` quando nao ha disponibilidade
+
+Erros de conexao MCP nao interrompem execucao. O runtime faz fallback automatico e segue sem contexto MCP.
+
 ## Requisitos
 
 - Python 3.13+

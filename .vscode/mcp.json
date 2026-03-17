@@ -5,7 +5,7 @@
 			"type": "http"
 		},
         "Docs by LangChain": {
-			"url": "https://docs.langchain.com/mcp",
+			"url": "https://docs.langchain.com/mcp/",
 			"type": "http"
 		}
 	},

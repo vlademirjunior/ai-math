@@ -12,6 +12,7 @@ dependencies = [
     "prompt-toolkit>=3.0.52",
     "rich>=14.3.3",
     "typer>=0.16.1",
+    "langchain-mcp-adapters>=0.2.2",
 ]
 
 [dependency-groups]
@@ -21,7 +22,9 @@ dev = [
     "nuitka>=4.0.5",
     "pyinstaller>=6.19.0",
     "pytest>=8.4.2",
+    "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.0.0",
+    "pytest-httpserver>=1.1.5",
     "ruff>=0.15.5",
 ]
 

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import sys
+import threading
+import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,7 +14,7 @@ from datetime import datetime
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, Protocol, cast
 from uuid import uuid4
 
 import typer
@@ -34,6 +38,7 @@ from rich.text import Text
 console = Console()
 error_console = Console(stderr=True)
 app = typer.Typer(help="Helo CLI (AI)", no_args_is_help=True)
+logger = logging.getLogger(__name__)
 
 IMPLEMENTER_STOP_TOKEN = "STOP_FOR_COMMIT"
 IMPLEMENTER_DONE_TOKEN = "IMPLEMENTATION_COMPLETE"
@@ -41,6 +46,7 @@ STATUS_EVENT_PREFIX = "__STATUS__::"
 DUMP_EVENT_PREFIX = "__DUMP__::"
 META_CONTEXT_WINDOW_FALLBACK = 128_000
 MAX_CONTEXT_FILE_CHARS = 12_000
+MAX_MCP_CONTEXT_CHARS = 6_000
 MAX_DIRECTORY_CONTEXT_ITEMS = 60
 MAX_VERBOSE_DUMP_CHARS = 4_000
 EXIT_COMMANDS = {"exit", "quit", "/exit"}
@@ -55,6 +61,11 @@ class ContextBuildResult:
     prompt: str
     sources: list[str]
     warnings: list[str]
+    mcp_sources_used: list[str]
+    mcp_chars_used: int
+    mcp_servers_offline: list[str]
+    mcp_tools_available: int
+    mcp_resources_available: int
 
 
 @dataclass
@@ -77,6 +88,11 @@ class ChatInteractionMetadata:
     last_tokens: int
     total_tokens: int
     context_window: int
+    mcp_sources_used: list[str]
+    mcp_chars_used: int
+    mcp_servers_offline: list[str]
+    mcp_tools_available: int
+    mcp_resources_available: int
 
 
 class ChatCompleter(Completer):
@@ -218,17 +234,488 @@ def _summarize_directory_for_context(path: Path, project_root: Path) -> str:
     return lines
 
 
-def build_contextual_prompt(message: str, project_root: Path) -> ContextBuildResult:
-    cleaned_message, refs = extract_context_references(message)
-    if not refs:
-        return ContextBuildResult(prompt=message, sources=[], warnings=[])
+def _trim_to_remaining(text: str, remaining: int) -> tuple[str, int]:
+    if remaining <= 0:
+        return "", 0
+    if len(text) <= remaining:
+        return text, len(text)
+    suffix = "\n\n[truncated: context budget exceeded]"
+    safe = max(0, remaining - len(suffix))
+    return f"{text[:safe]}{suffix}", remaining
 
+
+class MCPServerConfig(BaseModel):
+    transport: Literal["stdio", "streamable_http", "sse", "websocket"]
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    timeout: int = 30
+
+    @model_validator(mode="after")
+    def validate_required_transport_fields(self) -> MCPServerConfig:
+        if self.transport == "stdio" and not self.command:
+            raise ValueError("command is required when transport=stdio")
+        if self.transport in {"streamable_http", "sse", "websocket"} and not self.url:
+            raise ValueError("url is required for http/sse/websocket transports")
+        return self
+
+
+def _normalize_mcp_transport(raw: str | None) -> str:
+    if raw is None:
+        return ""
+    lowered = raw.strip().lower()
+    aliases = {
+        "http": "streamable_http",
+        "streamable-http": "streamable_http",
+        "streamable_http": "streamable_http",
+        "ws": "websocket",
+    }
+    return aliases.get(lowered, lowered)
+
+
+def _load_mcp_servers_from_file(config_path: Path) -> dict[str, MCPServerConfig]:
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    servers_raw = data.get("servers")
+    if not isinstance(servers_raw, dict):
+        return {}
+
+    parsed: dict[str, MCPServerConfig] = {}
+    for name, payload in servers_raw.items():
+        if not isinstance(name, str) or not isinstance(payload, dict):
+            continue
+        transport = _normalize_mcp_transport(
+            cast(str | None, payload.get("transport") or payload.get("type"))
+        )
+        if transport not in {"stdio", "streamable_http", "sse", "websocket"}:
+            continue
+        try:
+            parsed[name] = MCPServerConfig(
+                transport=cast(
+                    Literal["stdio", "streamable_http", "sse", "websocket"],
+                    transport,
+                ),
+                command=cast(str | None, payload.get("command")),
+                args=[str(item) for item in payload.get("args", []) if isinstance(item, str)],
+                url=cast(str | None, payload.get("url")),
+                headers={
+                    str(k): str(v)
+                    for k, v in cast(dict[str, Any], payload.get("headers", {})).items()
+                }
+                if isinstance(payload.get("headers"), dict)
+                else {},
+                timeout=int(payload.get("timeout", 30)),
+            )
+        except (TypeError, ValueError):
+            continue
+
+    return parsed
+
+
+def load_mcp_servers_from_workspace(project_root: Path) -> dict[str, MCPServerConfig]:
+    merged: dict[str, MCPServerConfig] = {}
+    for path in (project_root / ".agents" / "mcp.json", project_root / ".vscode" / "mcp.json"):
+        merged.update(_load_mcp_servers_from_file(path))
+    return merged
+
+
+@dataclass(frozen=True)
+class MCPResourceBlob:
+    server_name: str
+    resource_uri: str
+    content: str
+
+
+@dataclass(frozen=True)
+class MCPServerStatus:
+    online: bool
+    tools_count: int = 0
+    resources_count: int = 0
+    last_error: str | None = None
+
+
+class MCPManagerLike(Protocol):
+    def has_servers(self) -> bool: ...
+
+    def get_server_status(self) -> dict[str, MCPServerStatus]: ...
+
+    @property
+    def cached_tools(self) -> dict[str, list[Any]] | None: ...
+
+    @property
+    def cached_resources(self) -> list[MCPResourceBlob] | None: ...
+
+    async def refresh(self) -> None: ...
+
+
+class MCPManager:
+    def __init__(
+        self,
+        settings: AppSettings,
+        client_factory: Callable[[dict[str, dict[str, Any]]], Any] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._client_factory = client_factory
+        self._client: Any | None = None
+        self._status: dict[str, MCPServerStatus] = {
+            name: MCPServerStatus(online=False, last_error="not connected")
+            for name in settings.mcp_servers
+        }
+        self._cached_tools: dict[str, list[Any]] | None = None
+        self._cached_resources: list[MCPResourceBlob] | None = None
+
+        # Start a background thread to refresh MCP status silently.
+        if self.has_servers():
+            thread = threading.Thread(target=self._background_refresh, daemon=True)
+            thread.start()
+
+    @property
+    def cached_tools(self) -> dict[str, list[Any]] | None:
+        return self._cached_tools
+
+    @property
+    def cached_resources(self) -> list[MCPResourceBlob] | None:
+        return self._cached_resources
+
+    def has_cached_tools(self) -> bool:
+        return self._cached_tools is not None
+
+    def has_cached_resources(self) -> bool:
+        return self._cached_resources is not None
+
+    async def refresh(self) -> None:
+        await self.get_all_tools()
+        await self.get_resources()
+
+    def _background_refresh(self) -> None:
+        # Continuously refresh MCP status in the background.
+        while True:
+            try:
+                asyncio.run(self.refresh())
+            except Exception:
+                pass
+            # Wait before refreshing again to avoid hammering MCP endpoints.
+            time.sleep(30)
+
+    def has_servers(self) -> bool:
+        return bool(self._settings.mcp_servers)
+
+    def is_available(self) -> bool:
+        return any(status.online for status in self._status.values())
+
+    def get_server_status(self) -> dict[str, MCPServerStatus]:
+        return dict(self._status)
+
+    def _client_config(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for name, cfg in self._settings.mcp_servers.items():
+            entry: dict[str, Any] = {
+                "transport": cfg.transport,
+                "timeout": cfg.timeout,
+                "headers": cfg.headers,
+            }
+            if cfg.command:
+                entry["command"] = cfg.command
+            if cfg.args:
+                entry["args"] = cfg.args
+            if cfg.url:
+                entry["url"] = cfg.url
+            payload[name] = entry
+        return payload
+
+    async def _ensure_client(self) -> Any | None:
+        if self._client is not None:
+            return self._client
+        if not self._settings.mcp_servers:
+            return None
+
+        try:
+            config = self._client_config()
+            if self._client_factory is not None:
+                self._client = self._client_factory(config)
+            else:
+                from langchain_mcp_adapters.client import MultiServerMCPClient
+                from langchain_mcp_adapters.sessions import (
+                    SSEConnection,
+                    StdioConnection,
+                    StreamableHttpConnection,
+                    WebsocketConnection,
+                )
+
+                typed: dict[
+                    str,
+                    StdioConnection
+                    | SSEConnection
+                    | StreamableHttpConnection
+                    | WebsocketConnection,
+                ] = cast(
+                    dict[
+                        str,
+                        StdioConnection
+                        | SSEConnection
+                        | StreamableHttpConnection
+                        | WebsocketConnection,
+                    ],
+                    config,
+                )
+                self._client = MultiServerMCPClient(typed)
+            return self._client
+        except Exception as error:
+            for name in self._settings.mcp_servers:
+                self._status[name] = MCPServerStatus(online=False, last_error=str(error))
+                logger.warning(
+                    "MCP server '%s' is offline: %s. Continuing without MCP context.",
+                    name,
+                    error,
+                )
+            return None
+
+    async def _fetch_server_tools(self, server_name: str) -> list[Any]:
+        client = await self._ensure_client()
+        if client is None:
+            return []
+
+        method = getattr(client, "get_tools", None)
+        if method is None:
+            return []
+
+        # Try different call signatures until one succeeds.
+        try:
+            value = method(server_name=server_name)
+        except TypeError:
+            try:
+                value = method(server_name)
+            except TypeError:
+                try:
+                    value = method()
+                except TypeError:
+                    return []
+
+        if asyncio.iscoroutine(value):
+            value = await value
+        if isinstance(value, list):
+            return value
+        return []
+
+    async def _fetch_server_resources(self, server_name: str) -> list[MCPResourceBlob]:
+        client = await self._ensure_client()
+        if client is None:
+            return []
+
+        for method_name in ("get_resources", "list_resources"):
+            method = getattr(client, method_name, None)
+            if method is None:
+                continue
+            # Try various call signatures for maximum compatibility.
+            try:
+                value = method(server_name=server_name)
+            except TypeError:
+                try:
+                    value = method(server_name)
+                except TypeError:
+                    try:
+                        value = method()
+                    except TypeError:
+                        continue
+
+            if asyncio.iscoroutine(value):
+                value = await value
+            blobs = self._normalize_resources(server_name, value)
+            if blobs:
+                return blobs
+        return []
+
+    @staticmethod
+    def _normalize_resources(server_name: str, value: Any) -> list[MCPResourceBlob]:
+        if not isinstance(value, list):
+            return []
+        blobs: list[MCPResourceBlob] = []
+        for item in value:
+            if isinstance(item, MCPResourceBlob):
+                blobs.append(item)
+                continue
+            if isinstance(item, dict):
+                uri = str(item.get("uri") or item.get("resource_uri") or "resource")
+                content = str(
+                    item.get("content")
+                    or item.get("text")
+                    or item.get("blob")
+                    or item.get("value")
+                    or ""
+                )
+                if content:
+                    blobs.append(
+                        MCPResourceBlob(
+                            server_name=server_name,
+                            resource_uri=uri,
+                            content=content,
+                        )
+                    )
+        return blobs
+
+    async def get_all_tools(self) -> dict[str, list[Any]]:
+        result: dict[str, list[Any]] = {}
+        for name in self._settings.mcp_servers:
+            try:
+                tools = await self._fetch_server_tools(name)
+                result[name] = tools
+                status = self._status.get(name, MCPServerStatus(online=False))
+                self._status[name] = MCPServerStatus(
+                    online=True,
+                    tools_count=len(tools),
+                    resources_count=status.resources_count,
+                )
+            except (ConnectionError, TimeoutError, ValueError, Exception) as error:
+                status = _extract_http_status(error)
+                self._status[name] = MCPServerStatus(
+                    online=False,
+                    last_error=_sanitize_error_message(error),
+                )
+                if status:
+                    logger.debug("MCP server '%s' offline (%s).", name, status)
+                else:
+                    logger.debug(
+                        "MCP server '%s' offline: %s.",
+                        name,
+                        _sanitize_error_message(error),
+                    )
+                result[name] = []
+        self._cached_tools = result
+        return result
+
+    async def get_resources(self) -> list[MCPResourceBlob]:
+        result: list[MCPResourceBlob] = []
+        for name in self._settings.mcp_servers:
+            try:
+                resources = await self._fetch_server_resources(name)
+                result.extend(resources)
+                status = self._status.get(name, MCPServerStatus(online=False))
+                self._status[name] = MCPServerStatus(
+                    online=True,
+                    tools_count=status.tools_count,
+                    resources_count=len(resources),
+                )
+            except (ConnectionError, TimeoutError, ValueError, Exception) as error:
+                status = _extract_http_status(error)
+                sanitized = _sanitize_error_message(error)
+                self._status[name] = MCPServerStatus(
+                    online=False,
+                    last_error=sanitized,
+                )
+                if status:
+                    logger.debug("MCP server '%s' offline (%s).", name, status)
+                else:
+                    logger.debug("MCP server '%s' offline: %s.", name, sanitized)
+        self._cached_resources = result
+        return result
+
+
+def _sanitize_error_message(error: BaseException) -> str:
+    """Produce a compact, user-facing error message without full tracebacks."""
+
+    status = _extract_http_status(error)
+    if status:
+        return status
+
+    # ExceptionGroup tends to include long "unhandled errors" wrappers; prefer first meaningful suberror.
+    if isinstance(error, BaseExceptionGroup):
+        for sub in error.exceptions:
+            msg = _sanitize_error_message(sub)
+            if msg:
+                return msg
+
+    text = str(error).strip()
+    if not text:
+        text = type(error).__name__
+    # Only keep the first line; strip common 'unhandled errors' verbosity.
+    first_line = text.splitlines()[0]
+    if len(first_line) > 200:
+        first_line = first_line[:197] + "..."
+    return first_line
+
+
+def _extract_http_status(error: BaseException) -> str | None:
+    # Try to extract an HTTP status when using httpx / anyio TaskGroup wrapping.
+    try:
+        import httpx
+    except ImportError:
+        return None
+
+    if isinstance(error, httpx.HTTPStatusError):
+        resp = getattr(error, "response", None)
+        if resp is not None:
+            return f"HTTP {resp.status_code} {resp.reason_phrase}"
+        return "HTTP error"
+
+    if isinstance(error, BaseExceptionGroup):
+        for sub in error.exceptions:
+            found = _extract_http_status(sub)
+            if found:
+                return found
+    return None
+
+
+def _run_async(coro: Any) -> Any:
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+
+def _collect_agent_skill_context(
+    project_root: Path, remaining_budget: int
+) -> tuple[list[str], list[str], int]:
+    if remaining_budget <= 0:
+        return [], [], 0
+    agents_dir = project_root / ".agents"
+    if not agents_dir.exists() or not agents_dir.is_dir():
+        return [], [], 0
+
+    blocks: list[str] = []
+    sources: list[str] = []
+    consumed = 0
+    for skill_path in sorted(agents_dir.glob("*/SKILL.md")):
+        rel = skill_path.relative_to(project_root).as_posix()
+        raw = _read_file_for_context(skill_path)
+        formatted = f"### {rel}\n{raw}"
+        remaining = remaining_budget - consumed
+        clipped, used = _trim_to_remaining(formatted, remaining)
+        if used <= 0:
+            break
+        blocks.append(clipped)
+        sources.append(rel)
+        consumed += used
+        if consumed >= remaining_budget:
+            break
+    return blocks, sources, consumed
+
+
+def build_contextual_prompt(
+    message: str,
+    project_root: Path,
+    mcp_manager: MCPManagerLike | None = None,
+) -> ContextBuildResult:
+    cleaned_message, refs = extract_context_references(message)
     warnings: list[str] = []
     sources: list[str] = []
     context_blocks: list[str] = []
     seen: set[Path] = set()
+    local_budget_used = 0
 
     for ref in refs:
+        if local_budget_used >= MAX_CONTEXT_FILE_CHARS:
+            break
         resolved = _resolve_context_path(project_root, ref)
         if resolved is None:
             warnings.append(f"Contexto ignorado (fora do projeto): #{ref}")
@@ -243,14 +730,75 @@ def build_contextual_prompt(message: str, project_root: Path) -> ContextBuildRes
         sources.append(rel)
         if resolved.is_file():
             file_context = _read_file_for_context(resolved)
-            context_blocks.append(f"### {rel}\n{file_context}")
-            continue
-        directory_context = _summarize_directory_for_context(resolved, project_root)
-        context_blocks.append(f"### {rel}/\n{directory_context}")
+            formatted = f"### {rel}\n{file_context}"
+        else:
+            directory_context = _summarize_directory_for_context(resolved, project_root)
+            formatted = f"### {rel}/\n{directory_context}"
+
+        remaining = MAX_CONTEXT_FILE_CHARS - local_budget_used
+        clipped, used = _trim_to_remaining(formatted, remaining)
+        if used <= 0:
+            break
+        context_blocks.append(clipped)
+        local_budget_used += used
+
+    if refs:
+        remaining_file_budget = MAX_CONTEXT_FILE_CHARS - local_budget_used
+        agent_blocks, agent_sources, agent_used = _collect_agent_skill_context(
+            project_root, remaining_file_budget
+        )
+        context_blocks.extend(agent_blocks)
+        sources.extend(agent_sources)
+        local_budget_used += agent_used
+
+    mcp_sources_used: list[str] = []
+    mcp_chars_used = 0
+    mcp_servers_offline: list[str] = []
+    mcp_tools_available = 0
+    mcp_resources_available = 0
+
+    if mcp_manager is not None and mcp_manager.has_servers():
+        tools = getattr(mcp_manager, "cached_tools", None)
+        if tools is None:
+            tools = cast(dict[str, list[Any]], _run_async(mcp_manager.get_all_tools()))
+        mcp_tools_available = sum(len(items) for items in tools.values())
+
+        resources = getattr(mcp_manager, "cached_resources", None)
+        if resources is None:
+            resources = cast(list[MCPResourceBlob], _run_async(mcp_manager.get_resources()))
+        mcp_resources_available = len(resources)
+
+        for resource in resources:
+            if mcp_chars_used >= MAX_MCP_CONTEXT_CHARS:
+                break
+            block = f"[MCP: {resource.server_name}] {resource.resource_uri}\n\n{resource.content}"
+            clipped, used = _trim_to_remaining(block, MAX_MCP_CONTEXT_CHARS - mcp_chars_used)
+            if used <= 0:
+                break
+            context_blocks.append(clipped)
+            mcp_chars_used += used
+            if resource.server_name not in mcp_sources_used:
+                mcp_sources_used.append(resource.server_name)
+
+        statuses = mcp_manager.get_server_status()
+        mcp_servers_offline = []
+        for name, status in statuses.items():
+            if not status.online:
+                if status.last_error:
+                    mcp_servers_offline.append(f"{name} ({status.last_error})")
+                else:
+                    mcp_servers_offline.append(name)
 
     if not context_blocks:
         return ContextBuildResult(
-            prompt=cleaned_message or message, sources=sources, warnings=warnings
+            prompt=cleaned_message or message,
+            sources=sources,
+            warnings=warnings,
+            mcp_sources_used=mcp_sources_used,
+            mcp_chars_used=mcp_chars_used,
+            mcp_servers_offline=mcp_servers_offline,
+            mcp_tools_available=mcp_tools_available,
+            mcp_resources_available=mcp_resources_available,
         )
 
     user_prompt = (
@@ -262,7 +810,27 @@ def build_contextual_prompt(message: str, project_root: Path) -> ContextBuildRes
         + "\n\nPedido do usuario:\n"
         + user_prompt
     )
-    return ContextBuildResult(prompt=prompt, sources=sources, warnings=warnings)
+    logger.info(
+        "Context built: files_agents=%s, mcp=%s, total=%s",
+        local_budget_used,
+        mcp_chars_used,
+        len(prompt),
+    )
+    logger.debug(
+        "MCP servers: online=%s offline=%s",
+        mcp_sources_used,
+        mcp_servers_offline,
+    )
+    return ContextBuildResult(
+        prompt=prompt,
+        sources=sources,
+        warnings=warnings,
+        mcp_sources_used=mcp_sources_used,
+        mcp_chars_used=mcp_chars_used,
+        mcp_servers_offline=mcp_servers_offline,
+        mcp_tools_available=mcp_tools_available,
+        mcp_resources_available=mcp_resources_available,
+    )
 
 
 def build_chat_session_prompt(project_root: Path) -> PromptSession[str]:
@@ -336,6 +904,10 @@ def render_assistant_message(response: str, metadata: ChatInteractionMetadata) -
 
     skills = "\n".join(metadata.skills_loaded) if metadata.skills_loaded else "(none)"
     sources = "\n".join(metadata.sources) if metadata.sources else "(none)"
+    mcp_sources = "\n".join(metadata.mcp_sources_used) if metadata.mcp_sources_used else "(none)"
+    mcp_offline = (
+        "\n".join(metadata.mcp_servers_offline) if metadata.mcp_servers_offline else "(none)"
+    )
     meta_panel = Panel(
         Text.from_markup(
             "[bold]Session[/]\n"
@@ -344,6 +916,11 @@ def render_assistant_message(response: str, metadata: ChatInteractionMetadata) -
             f"{skills}\n\n"
             "[bold]Sources used[/]\n"
             f"{sources}\n\n"
+            "[bold]MCP[/]\n"
+            f"sources={mcp_sources}\n"
+            f"offline={mcp_offline}\n"
+            f"tools={metadata.mcp_tools_available} resources={metadata.mcp_resources_available}\n"
+            f"chars={metadata.mcp_chars_used}\n\n"
             "[bold]Tokens[/]\n"
             f"last={metadata.last_tokens} total={metadata.total_tokens}\n"
             "[bold]Context window[/]\n"
@@ -464,6 +1041,7 @@ class AppSettings(BaseSettings):
     project_root: Path = Field(default_factory=lambda: Path.cwd())
     thread_id_default: str = "helo-ai-cli-session"
     skills_required: bool = False
+    mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
     @property
     def openrouter_effective_api_key(self) -> str | None:
@@ -480,6 +1058,8 @@ class AppSettings(BaseSettings):
                 )
         if self.enable_langsmith and not os.getenv("LANGSMITH_API_KEY"):
             raise ValueError("LANGSMITH_API_KEY is required when enable_langsmith=true")
+        file_mcp_servers = load_mcp_servers_from_workspace(self.project_root)
+        self.mcp_servers = {**file_mcp_servers, **self.mcp_servers}
         return self
 
 
@@ -743,6 +1323,7 @@ class AgentRuntime:
         )
         self._role_agents: dict[tuple[ModelRole, bool], Any] = {}
         self._chat_agent: Any | None = None
+        self.mcp_manager = MCPManager(settings)
 
     def _builtin_skill_path(self, role: ModelRole) -> Path:
         skill_name = {
@@ -1341,6 +1922,48 @@ def build_output_handler(
     return handler
 
 
+def render_mcp_status(mcp_manager: MCPManager) -> None:
+    if not mcp_manager.has_servers():
+        return
+    statuses = mcp_manager.get_server_status()
+    online = [name for name, status in statuses.items() if status.online]
+    offline = [name for name, status in statuses.items() if not status.online]
+    tools = sum(status.tools_count for status in statuses.values())
+    resources = sum(status.resources_count for status in statuses.values())
+
+    if online and not offline:
+        console.print(
+            f"[green]✓ MCP servers: {', '.join(online)} ({tools} tools, {resources} resources)[/]"
+        )
+        return
+    if online and offline:
+        online_desc = ", ".join(online)
+        offline_desc = ", ".join(f"{name} (offline)" for name in offline)
+        console.print(
+            "[yellow]⚠ MCP servers: "
+            f"{offline_desc}, {online_desc} ({tools} tools) - some features may be limited[/]"
+        )
+        return
+    console.print("[yellow][MCP] All MCP servers offline - skipping MCP context[/]")
+
+
+def render_mcp_context_update(contextual: ContextBuildResult) -> None:
+    if contextual.mcp_sources_used:
+        console.print(
+            "[cyan][MCP] Added "
+            f"{contextual.mcp_resources_available} resources from "
+            f"{', '.join(contextual.mcp_sources_used)} server(s)[/]"
+        )
+        return
+    if contextual.mcp_servers_offline:
+        console.print("[yellow][MCP] All MCP servers offline - skipping MCP context[/]")
+
+
+def _runtime_mcp_manager(runtime: Any) -> MCPManager | None:
+    manager = getattr(runtime, "mcp_manager", None)
+    return manager if isinstance(manager, MCPManager) else None
+
+
 @contextmanager
 def noop_context():  # type: ignore[no-untyped-def]
     yield
@@ -1380,11 +2003,16 @@ def chat(
 ) -> None:
     settings = get_settings()
     runtime = AgentRuntime(settings)
+    mcp_manager = _runtime_mcp_manager(runtime)
     metrics = ChatSessionMetrics()
     context_window = infer_context_window(settings)
 
     def execute_single_message(message: str, current_thread_id: str) -> str:
-        contextual = build_contextual_prompt(message, settings.project_root)
+        contextual = build_contextual_prompt(
+            message,
+            settings.project_root,
+            mcp_manager=mcp_manager,
+        )
         effective_prompt = contextual.prompt
         effective_on_chunk = build_output_handler(verbose)
         selected_role = "chat"
@@ -1393,7 +2021,11 @@ def chat(
         if manual_role:
             role, role_prompt = manual_role
             selected_role = role.value
-            role_prompt_with_context = build_contextual_prompt(role_prompt, settings.project_root)
+            role_prompt_with_context = build_contextual_prompt(
+                role_prompt,
+                settings.project_root,
+                mcp_manager=mcp_manager,
+            )
             contextual = role_prompt_with_context
             runtime.run_manual_role(
                 role=role,
@@ -1439,6 +2071,11 @@ def chat(
                     last_tokens=metrics.last_tokens,
                     total_tokens=metrics.total_tokens,
                     context_window=context_window,
+                    mcp_sources_used=contextual.mcp_sources_used,
+                    mcp_chars_used=contextual.mcp_chars_used,
+                    mcp_servers_offline=contextual.mcp_servers_offline,
+                    mcp_tools_available=contextual.mcp_tools_available,
+                    mcp_resources_available=contextual.mcp_resources_available,
                 ),
             )
         return current_thread_id
@@ -1513,14 +2150,24 @@ def run(
 ) -> None:
     settings = get_settings()
     runtime = AgentRuntime(settings)
+    mcp_manager = _runtime_mcp_manager(runtime)
     with tracing_enabled_context(settings.enable_langsmith, settings.langsmith_project):
         on_chunk = build_output_handler(verbose)
         manual_role = parse_manual_role_command(prompt)
+        contextual = build_contextual_prompt(
+            prompt,
+            settings.project_root,
+            mcp_manager=mcp_manager,
+        )
         if manual_role:
             role, role_prompt = manual_role
             runtime.run_manual_role(
                 role=role,
-                prompt=role_prompt,
+                prompt=build_contextual_prompt(
+                    role_prompt,
+                    settings.project_root,
+                    mcp_manager=mcp_manager,
+                ).prompt,
                 thread_id=thread_id,
                 auto=auto,
                 request_continue=ask_continue_after_checkpoint if not auto else None,
@@ -1528,7 +2175,7 @@ def run(
             )
         elif should_trigger_pipeline(prompt):
             runtime.run_pipeline(
-                prompt=prompt,
+                prompt=contextual.prompt,
                 thread_id=thread_id,
                 auto=auto,
                 request_continue=ask_continue_after_checkpoint if not auto else None,
@@ -1536,7 +2183,7 @@ def run(
             )
         else:
             output = runtime.run_chat(
-                prompt=prompt,
+                prompt=contextual.prompt,
                 thread_id=thread_id,
                 on_chunk=on_chunk,
             )
@@ -1610,6 +2257,7 @@ def doctor() -> None:
         "skills_source": discover_skills_source(settings.project_root, settings.skills_required),
         "langsmith_enabled": settings.enable_langsmith,
         "langsmith_env": os.getenv("LANGSMITH_TRACING", "false"),
+        "mcp_servers_configured": sorted(settings.mcp_servers.keys()),
     }
     console.print_json(data=checks)
 
