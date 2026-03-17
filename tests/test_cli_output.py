@@ -8,6 +8,7 @@ from main import (
     AgentRuntime,
     AppSettings,
     ModelRole,
+    OutputStreamState,
     Provider,
     RoleModelConfig,
     build_output_handler,
@@ -55,6 +56,48 @@ def test_output_handler_shows_dump_when_verbose(monkeypatch) -> None:
     handler(f"{DUMP_EVENT_PREFIX}{{'messages': []}}")
 
     assert any("messages" in item for item in printed)
+
+
+def test_output_handler_shows_clarification_when_not_verbose(monkeypatch) -> None:
+    printed: list[str] = []
+
+    def fake_print(*args, **kwargs) -> None:
+        if args:
+            printed.append(str(args[0]))
+
+    monkeypatch.setattr(main.console, "print", fake_print)
+
+    state = OutputStreamState()
+    handler = build_output_handler(verbose=False, state=state)
+    handler("Perguntas de Clarificacao:\n1. Qual pasta devo usar?")
+
+    assert state.clarification_requested is True
+    assert printed
+
+
+def test_assistant_text_extracts_questions_from_tool_call() -> None:
+    message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "name": "vscode_askQuestions",
+                "args": {
+                    "questions": [
+                        {
+                            "header": "Workspace",
+                            "question": "Qual diretorio devo usar?",
+                            "options": [{"label": "src"}, {"label": "app"}],
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+
+    text = AgentRuntime._assistant_message_to_text(message)
+    assert "Perguntas de Clarificacao" in text
+    assert "Qual diretorio devo usar?" in text
 
 
 def test_run_pipeline_emits_phase_status_events(monkeypatch, tmp_path: Path) -> None:

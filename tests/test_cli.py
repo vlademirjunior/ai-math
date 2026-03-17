@@ -91,6 +91,34 @@ def test_role_command_routes_manual_role(monkeypatch: pytest.MonkeyPatch) -> Non
     assert calls == [("planner", True)]
 
 
+def test_role_command_handles_clarification_followup(monkeypatch: pytest.MonkeyPatch) -> None:
+    prompts: list[str] = []
+
+    class StubRuntime:
+        def __init__(self, settings: AppSettings) -> None:
+            self.settings = settings
+
+        def run_manual_role(
+            self, role, prompt: str, thread_id: str, *, auto: bool, request_continue, on_chunk
+        ) -> list:
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                on_chunk("Perguntas de Clarificacao:\n1. Qual arquivo devo ler?")
+            else:
+                on_chunk("Plano criado.")
+            return []
+
+    answers = iter(["Ler .vscode/settings.json"])
+
+    monkeypatch.setattr(main, "get_settings", _litellm_settings)
+    monkeypatch.setattr(main, "AgentRuntime", StubRuntime)
+    monkeypatch.setattr(main.console, "input", lambda _prompt: next(answers, ""))
+
+    result = runner.invoke(app, ["role", "planner", "Criar plano inicial"])
+    assert result.exit_code == 0
+    assert prompts == ["Criar plano inicial", "Ler .vscode/settings.json"]
+
+
 def test_chat_prompt_slash_routes_manual_role(monkeypatch: pytest.MonkeyPatch) -> None:
     manual_calls: list[tuple[str, str, bool]] = []
     pipeline_calls: list[str] = []

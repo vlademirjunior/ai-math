@@ -43,6 +43,8 @@ Permite chamar um role especifico:
 
 - comando `role`
 - slash command no chat (`/planner`, `/generator`, `/implementer`)
+*O comando `role` fica em modo interativo por padrão, permitindo responder perguntas de clarificação do agente durante a execução.*
+*Use `--no-interactive-followup` para executar apenas uma vez sem aguardar respostas.*
 
 ## Implementer: HITL e Auto
 
@@ -119,6 +121,7 @@ uv run python main.py run "Implement tests for parser" --verbose
 
 # Manual por role
 uv run python main.py role planner "Criar plano da feature XPTO"
+uv run python main.py role planner "Criar plano da feature XPTO" --no-interactive-followup
 uv run python main.py role generator "Gerar implementation guide com checkpoints"
 uv run python main.py role implementer "Executar implementation atual"
 uv run python main.py role implementer "Executar implementation atual" --auto
@@ -161,7 +164,7 @@ uv run pytest
 
 ```bash
 uv run ruff check .
-uv run mypy --no-incremental .
+uv run mypy --no-incremental . # execução limpa, sem cache!
 ```
 
 ## Executavel Standalone

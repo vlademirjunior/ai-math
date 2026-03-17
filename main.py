@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from collections.abc import Callable, Iterable, Iterator
@@ -60,6 +61,11 @@ class ContextBuildResult:
 class ChatSessionMetrics:
     total_tokens: int = 0
     last_tokens: int = 0
+
+
+@dataclass
+class OutputStreamState:
+    clarification_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -735,6 +741,8 @@ class AgentRuntime:
         self.skills = discover_skills_source(
             settings.project_root, required=settings.skills_required
         )
+        self._role_agents: dict[tuple[ModelRole, bool], Any] = {}
+        self._chat_agent: Any | None = None
 
     def _builtin_skill_path(self, role: ModelRole) -> Path:
         skill_name = {
@@ -850,12 +858,100 @@ class AgentRuntime:
             role = str(message.get("role", "")).lower()
             is_assistant = role in {"assistant", "ai"}
             content = message.get("content")
-            return AgentRuntime._content_to_text(content) if is_assistant else ""
+            if not is_assistant:
+                return ""
+            content_text = AgentRuntime._content_to_text(content)
+            clarification = AgentRuntime._extract_clarification_text(message)
+            if content_text and clarification:
+                return f"{content_text}\n\n{clarification}"
+            return content_text or clarification
 
         if not is_assistant:
             return ""
 
-        return AgentRuntime._content_to_text(getattr(message, "content", None))
+        content_text = AgentRuntime._content_to_text(getattr(message, "content", None))
+        clarification = AgentRuntime._extract_clarification_text(message)
+        if content_text and clarification:
+            return f"{content_text}\n\n{clarification}"
+        return content_text or clarification
+
+    @staticmethod
+    def _extract_clarification_text(message: Any) -> str:
+        tool_calls: list[Any] = []
+        if isinstance(message, dict):
+            raw_tool_calls = message.get("tool_calls")
+            if isinstance(raw_tool_calls, list):
+                tool_calls.extend(raw_tool_calls)
+            additional_kwargs = message.get("additional_kwargs")
+            if isinstance(additional_kwargs, dict):
+                ak_tool_calls = additional_kwargs.get("tool_calls")
+                if isinstance(ak_tool_calls, list):
+                    tool_calls.extend(ak_tool_calls)
+        else:
+            raw_tool_calls = getattr(message, "tool_calls", None)
+            if isinstance(raw_tool_calls, list):
+                tool_calls.extend(raw_tool_calls)
+            additional_kwargs = getattr(message, "additional_kwargs", None)
+            if isinstance(additional_kwargs, dict):
+                ak_tool_calls = additional_kwargs.get("tool_calls")
+                if isinstance(ak_tool_calls, list):
+                    tool_calls.extend(ak_tool_calls)
+
+        parsed_questions: list[dict[str, Any]] = []
+        for call in tool_calls:
+            if isinstance(call, dict):
+                name = str(call.get("name") or "").strip()
+                args_payload = call.get("args")
+                if args_payload is None and isinstance(call.get("function"), dict):
+                    fn = cast(dict[str, Any], call.get("function"))
+                    name = str(fn.get("name") or name).strip()
+                    args_payload = fn.get("arguments")
+            else:
+                name = str(getattr(call, "name", "")).strip()
+                args_payload = getattr(call, "args", None)
+
+            if name not in {"vscode_askQuestions", "askQuestions"}:
+                continue
+
+            parsed = AgentRuntime._parse_tool_call_args(args_payload)
+            questions = parsed.get("questions")
+            if isinstance(questions, list):
+                for question in questions:
+                    if isinstance(question, dict):
+                        parsed_questions.append(question)
+
+        if not parsed_questions:
+            return ""
+
+        lines = ["Perguntas de Clarificacao:"]
+        for idx, question in enumerate(parsed_questions, start=1):
+            question_text = str(question.get("question") or question.get("header") or "").strip()
+            if not question_text:
+                question_text = "Pergunta sem texto"
+            lines.append(f"{idx}. {question_text}")
+
+            options = question.get("options")
+            if isinstance(options, list):
+                labels = [
+                    str(opt.get("label", "")).strip() for opt in options if isinstance(opt, dict)
+                ]
+                labels = [label for label in labels if label]
+                if labels:
+                    lines.append(f"   Opcoes: {', '.join(labels)}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_tool_call_args(args_payload: Any) -> dict[str, Any]:
+        if isinstance(args_payload, dict):
+            return args_payload
+        if isinstance(args_payload, str):
+            try:
+                parsed = json.loads(args_payload)
+            except json.JSONDecodeError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
 
     @staticmethod
     def _content_to_text(content: Any) -> str:
@@ -884,6 +980,11 @@ class AgentRuntime:
         return rendered
 
     def create_role_agent(self, role: ModelRole, auto: bool = False) -> Any:
+        cache_key = (role, auto)
+        cached = self._role_agents.get(cache_key)
+        if cached is not None:
+            return cached
+
         role_model = self.model_factory.create(role)
         kwargs: dict[str, Any] = {
             "model": role_model,
@@ -892,12 +993,17 @@ class AgentRuntime:
         }
         if self.skills:
             kwargs["skills"] = self.skills
-        return create_deep_agent(**kwargs)
+        agent = create_deep_agent(**kwargs)
+        self._role_agents[cache_key] = agent
+        return agent
 
     def create_planner_agent(self) -> Any:
         return self.create_role_agent(ModelRole.PLANNER)
 
     def create_chat_agent(self) -> Any:
+        if self._chat_agent is not None:
+            return self._chat_agent
+
         chat_model = self.model_factory.create(self.policy.planner)
         kwargs: dict[str, Any] = {
             "model": chat_model,
@@ -909,7 +1015,8 @@ class AgentRuntime:
         }
         if self.skills:
             kwargs["skills"] = self.skills
-        return create_deep_agent(**kwargs)
+        self._chat_agent = create_deep_agent(**kwargs)
+        return self._chat_agent
 
     def stream_role(
         self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False
@@ -1199,7 +1306,20 @@ def ask_continue_after_checkpoint() -> bool:
         console.print("Type 'continue' or 'stop'.")
 
 
-def build_output_handler(verbose: bool) -> Callable[[str], None]:
+def is_clarification_text(text: str) -> bool:
+    normalized = text.lower()
+    hints = (
+        "perguntas de clarificacao",
+        "perguntas de clarificação",
+        "clarification questions",
+        "clarifying questions",
+    )
+    return any(hint in normalized for hint in hints)
+
+
+def build_output_handler(
+    verbose: bool, state: OutputStreamState | None = None
+) -> Callable[[str], None]:
     def handler(text: str) -> None:
         if text.startswith(STATUS_EVENT_PREFIX):
             message = text[len(STATUS_EVENT_PREFIX) :]
@@ -1209,6 +1329,11 @@ def build_output_handler(verbose: bool) -> Callable[[str], None]:
             if verbose:
                 dump = text[len(DUMP_EVENT_PREFIX) :]
                 console.print(f"[dim]{dump}[/]")
+            return
+        if is_clarification_text(text):
+            if state is not None:
+                state.clarification_requested = True
+            console.print(Panel(text, title="Clarificacao Necessaria", border_style="yellow"))
             return
         if verbose and text:
             console.print(text, end="")
@@ -1433,14 +1558,23 @@ def role_command(
         default=False,
         help="When enabled, prints intermediate streaming logs from model/tool execution.",
     ),
+    interactive_followup: bool = typer.Option(
+        default=True,
+        help=(
+            "When enabled, keeps role session open to answer clarification questions "
+            "in the same thread."
+        ),
+    ),
 ) -> None:
     settings = get_settings()
     runtime = AgentRuntime(settings)
-    with tracing_enabled_context(settings.enable_langsmith, settings.langsmith_project):
-        on_chunk = build_output_handler(verbose)
+
+    def run_once(prompt_text: str) -> OutputStreamState:
+        stream_state = OutputStreamState()
+        on_chunk = build_output_handler(verbose, stream_state)
         runtime.run_manual_role(
             role=role,
-            prompt=prompt,
+            prompt=prompt_text,
             thread_id=thread_id,
             auto=auto,
             request_continue=ask_continue_after_checkpoint
@@ -1448,6 +1582,19 @@ def role_command(
             else None,
             on_chunk=on_chunk,
         )
+        return stream_state
+
+    with tracing_enabled_context(settings.enable_langsmith, settings.langsmith_project):
+        stream_state = run_once(prompt)
+
+        while interactive_followup and stream_state.clarification_requested:
+            answer = console.input(
+                "[bold yellow]Responda a clarificacao (/exit para sair): [/]"
+            ).strip()
+            if answer.lower() in EXIT_COMMANDS:
+                break
+            stream_state = run_once(answer)
+
         console.print()
 
 

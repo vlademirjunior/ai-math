@@ -55,6 +55,9 @@ Config por role:
 - chamada direta por role (`role planner|generator|implementer`)
 - slash command no chat (`/planner ...`, `/generator ...`, `/implementer ...`)
 
+*O comando `role` fica em modo interativo por padrão para responder perguntas de clarificação do agente.*
+*Use `--no-interactive-followup` para executar apenas uma vez sem aguardar respostas.*
+
 ## Implementer: comportamento
 
 Modo padrao (sem `--auto`):
@@ -103,6 +106,7 @@ Assumindo binario em `./dist/deep-agents`:
 
 # Manual por role
 ./dist/deep-agents role planner "Criar plano da feature XPTO"
+./dist/deep-agents role planner "Criar plano da feature XPTO" --no-interactive-followup
 ./dist/deep-agents role generator "Gerar implementation guide com checkpoints"
 ./dist/deep-agents role implementer "Executar implementation atual"
 ./dist/deep-agents role implementer "Executar implementation atual" --auto
