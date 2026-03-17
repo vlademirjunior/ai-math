@@ -20,7 +20,7 @@ from rich.panel import Panel
 
 console = Console()
 error_console = Console(stderr=True)
-app = typer.Typer(help="Helo", no_args_is_help=True)
+app = typer.Typer(help="Helo CLI (AI)", no_args_is_help=True)
 
 IMPLEMENTER_STOP_TOKEN = "STOP_FOR_COMMIT"
 IMPLEMENTER_DONE_TOKEN = "IMPLEMENTATION_COMPLETE"
@@ -803,7 +803,7 @@ def chat(
             console.print()
             return
 
-        console.print(Panel("Interactive chat mode. Type 'exit' to stop.", title="Helo"))
+        console.print(Panel("Interactive chat mode. Type 'exit' to stop.", title="Helo CLI (AI)"))
         while True:
             message = console.input("[bold cyan]> [/]").strip()
             if message.lower() in {"exit", "quit"}:

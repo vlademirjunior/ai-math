@@ -1,4 +1,4 @@
-# Deep Agents CLI (One-File Runtime)
+# Helo CLI (AI)
 
 CLI para orquestrar um pipeline de 3 fases com roles especializados:
 
