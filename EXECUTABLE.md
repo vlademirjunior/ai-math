@@ -87,6 +87,7 @@ Assumindo binario em `./dist/deep-agents`:
 ./dist/deep-agents chat
 ./dist/deep-agents chat --prompt "Plan refactor for auth service"
 ./dist/deep-agents chat --prompt "Plan refactor for auth service" --auto
+./dist/deep-agents chat --prompt "Plan refactor for auth service" --verbose
 
 # Conversa natural (sem roles)
 ./dist/deep-agents chat --prompt "oi"
@@ -105,6 +106,7 @@ Assumindo binario em `./dist/deep-agents`:
 ./dist/deep-agents role generator "Gerar implementation guide com checkpoints"
 ./dist/deep-agents role implementer "Executar implementation atual"
 ./dist/deep-agents role implementer "Executar implementation atual" --auto
+./dist/deep-agents role implementer "Executar implementation atual" --verbose
 ```
 
 ## Build do Executavel

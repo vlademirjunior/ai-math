@@ -105,17 +105,24 @@ uv run python main.py chat --prompt "Plan refactor for auth service"
 # Pipeline totalmente automatico (sem HITL no implementer)
 uv run python main.py chat --prompt "Plan refactor for auth service" --auto
 
+# Pipeline com log detalhado (verbose)
+uv run python main.py chat --prompt "Plan refactor for auth service" --verbose
+
 # Execucao single-shot
 uv run python main.py run "Implement tests for parser"
 
 # Execucao single-shot em auto
 uv run python main.py run "Implement tests for parser" --auto
 
+# Execucao single-shot em modo verbose
+uv run python main.py run "Implement tests for parser" --verbose
+
 # Manual por role
 uv run python main.py role planner "Criar plano da feature XPTO"
 uv run python main.py role generator "Gerar implementation guide com checkpoints"
 uv run python main.py role implementer "Executar implementation atual"
 uv run python main.py role implementer "Executar implementation atual" --auto
+uv run python main.py role implementer "Executar implementation atual" --verbose
 
 # Slash command no chat (manual por role)
 uv run python main.py chat --prompt "/planner implementar feature xpto"
