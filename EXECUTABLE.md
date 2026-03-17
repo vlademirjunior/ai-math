@@ -1,166 +1,135 @@
-# Executável Helo
+# Executavel Deep Agents
 
-Este diretório contém o executável `deep-agents` (ou `deep-agents.exe` no Windows) que permite executar a CLI Deep Agents sem necessidade de Python instalado.
+Guia para uso do binario `deep-agents` sem Python local.
 
-## 📋 Requisitos
+## Requisitos
 
-- Sistema operacional Linux (ou Windows se construído no Windows)
-- Variáveis de ambiente configuradas (veja abaixo)
+- Linux x86_64 (ou Windows se o binario foi buildado em Windows)
+- Variaveis de ambiente configuradas
 
-## 🔧 Variáveis de Ambiente
+## Leitura de .env
 
-O executável lê variáveis de ambiente do sistema ou de um arquivo `.env` no diretório atual.
+Ordem de busca:
 
-Ordem de busca do `.env`:
+1. diretorio atual
+2. `PROJECT_ROOT/.env` (se definido)
+3. pasta do executavel (quando empacotado)
 
-1. Diretório atual de execução (`pwd`)
-2. `PROJECT_ROOT/.env` (se `PROJECT_ROOT` estiver definido)
-3. Pasta do executável (quando empacotado com PyInstaller)
+## Variaveis de Ambiente
 
-### Variáveis Obrigatórias
+Obrigatorias (dependendo do provider):
 
-Pelo menos uma das seguintes chaves API deve ser configurada, dependendo do provedor usado:
+- `OPENROUTER_API_KEY` (provider default)
+- `OPENAI_API_KEY` (fallback para OpenRouter)
+- `OLLAMA_BASE_URL` (quando usar ollama)
 
-- `OPENROUTER_API_KEY` - Para usar o provedor OpenRouter (padrão)
-- `OPENAI_API_KEY` - Também funciona como fallback para o provedor OpenRouter
-- `OLLAMA_BASE_URL` - Para usar o provedor Ollama local (padrão: http://localhost:11434)
+Opcionais:
 
-### Variáveis Opcionais
+- `PROJECT_ROOT`
+- `THREAD_ID_DEFAULT` (default: `deep-agents-session`)
+- `ENABLE_LANGSMITH`
+- `LANGSMITH_API_KEY`
+- `LANGSMITH_PROJECT`
 
-- `PROJECT_ROOT` - Caminho do projeto (padrão: diretório atual)
-- `THREAD_ID_DEFAULT` - ID da thread de conversa (padrão: "deep-agents-session")
-- `ENABLE_LANGSMITH` - Habilitar tracing do LangSmith (true/false)
-- `LANGSMITH_API_KEY` - API key do LangSmith (obrigatória se ENABLE_LANGSMITH=true)
-- `LANGSMITH_PROJECT` - Nome do projeto no LangSmith
+Config por role:
 
-### Configuração de Modelos
+- `PLANNER__PROVIDER`, `PLANNER__MODEL`, `PLANNER__TEMPERATURE`
+- `GENERATOR__PROVIDER`, `GENERATOR__MODEL`, `GENERATOR__TEMPERATURE`
+- `IMPLEMENTER__PROVIDER`, `IMPLEMENTER__MODEL`, `IMPLEMENTER__TEMPERATURE`
 
-As configurações de modelos podem ser sobrescritas com variáveis de ambiente usando o delimitador `__`:
+## Fluxos Suportados
 
-- `PLANNER__PROVIDER` - Provedor do planner (openrouter, ollama, litellm)
-- `PLANNER__MODEL` - Nome do modelo para o planner
-- `PLANNER__TEMPERATURE` - Temperatura do planner (0.0-1.0)
-- `GENERATOR__PROVIDER` - Provedor do generator
-- `GENERATOR__MODEL` - Modelo do generator
-- `GENERATOR__TEMPERATURE` - Temperatura do generator
-- `IMPLEMENTER__PROVIDER` - Provedor do implementer
-- `IMPLEMENTER__MODEL` - Modelo do implementer
-- `IMPLEMENTER__TEMPERATURE` - Temperatura do implementer
+### 1. Pipeline automatico por orquestracao
 
-Exemplo:
-```bash
-export PLANNER__MODEL="gpt-4o"
-export GENERATOR__TEMPERATURE=0.2
-```
+- planner -> generator -> implementer
+- cria `plans/{feature-name}/plan.md` e `plans/{feature-name}/implementation.md`
+- implementer le `implementation.md` para executar
 
-## 📁 Arquivo .env (Alternativa)
+### 2. Conversa natural
 
-Crie um arquivo `.env` no diretório onde o executável será rodado:
+- prompts casuais (ex: `oi`) respondem normalmente
+- sem acionar roles
 
-```env
-OPENROUTER_API_KEY=sua_chave_aqui
-# ou use OPENAI_API_KEY=sua_chave_aqui
-PLANNER__MODEL=stepfun/step-3.5-flash:free
-GENERATOR__MODEL=stepfun/step-3.5-flash:free
-IMPLEMENTER__MODEL=stepfun/step-3.5-flash:free
-PROJECT_ROOT=.
-```
+### 3. Manual por role
 
-## 🚀 Como Usar
+- chamada direta por role (`role planner|generator|implementer`)
+- slash command no chat (`/planner ...`, `/generator ...`, `/implementer ...`)
 
-### 1. Comandos Básicos
+## Implementer: comportamento
 
-```bash
-# Ver ajuda
-./deep-agents --help
+Modo padrao (sem `--auto`):
 
-# Testar configuração
-./deep-agents doctor
+- para em checkpoints de STOP & COMMIT
+- solicita commit/push manual do usuario
+- so continua com `continue`
 
-# Listar modelos disponíveis
-./deep-agents models
+Modo `--auto`:
 
-# Iniciar chat interativo
-./deep-agents chat
+- remove pausas HITL
+- executa continuo ate concluir
 
-# Executar tarefa única
-./deep-agents run "Implement a simple calc.py"
+Observacao:
 
-# Gerenciar skills
-./deep-agents skills
-```
+- o agente nao faz git automaticamente
 
-### 2. Usando com Variáveis de Ambiente
+## Comandos com Executavel
+
+Assumindo binario em `./dist/deep-agents`:
 
 ```bash
-# Definir variáveis diretamente na linha de comando
-OPENROUTER_API_KEY=sua_chave ./deep-agents doctor
-# ou
-OPENAI_API_KEY=sua_chave ./deep-agents doctor
+# Ajuda e diagnostico
+./dist/deep-agents --help
+./dist/deep-agents doctor
+./dist/deep-agents models
+./dist/deep-agents skills
 
-# Usar arquivo .env
-cp .env.example .env
-./deep-agents doctor
+# Chat (pipeline)
+./dist/deep-agents chat
+./dist/deep-agents chat --prompt "Plan refactor for auth service"
+./dist/deep-agents chat --prompt "Plan refactor for auth service" --auto
 
-# Verificar qual .env foi carregado
-# (campo "dotenv_path" no JSON)
+# Conversa natural (sem roles)
+./dist/deep-agents chat --prompt "oi"
+
+# Slash command no chat
+./dist/deep-agents chat --prompt "/planner implementar feature xpto"
+./dist/deep-agents chat --prompt "/generator gerar guia de implementacao"
+./dist/deep-agents chat --prompt "/implementer executar plano atual"
+
+# Single-shot
+./dist/deep-agents run "Implement tests for parser"
+./dist/deep-agents run "Implement tests for parser" --auto
+
+# Manual por role
+./dist/deep-agents role planner "Criar plano da feature XPTO"
+./dist/deep-agents role generator "Gerar implementation guide com checkpoints"
+./dist/deep-agents role implementer "Executar implementation atual"
+./dist/deep-agents role implementer "Executar implementation atual" --auto
 ```
 
-### 3. Modo de Tracing (Debug)
-
-Para habilitar tracing no LangSmith:
+## Build do Executavel
 
 ```bash
-export ENABLE_LANGSMITH=true
-export LANGSMITH_API_KEY=sua_chave_langsmith
-export LANGSMITH_PROJECT=deep-agents-cli
-./deep-agents doctor
-```
-
-## 📦 Distribuição
-
-O executável está localizado em `/workspace/dist/deep-agents`.
-
-Para distribuir:
-1. Copie o arquivo `deep-agents` para o sistema alvo
-2. Garanta que tenha permissão de execução: `chmod +x deep-agents`
-3. Configure as variáveis de ambiente ou arquivo `.env`
-4. Execute: `./deep-agents [COMANDO]`
-
-## 🔨 Construção
-
-Para reconstruir o executável:
-
-```bash
-# Instalar dependências
 uv sync
-
-# Build com PyInstaller
 .venv/bin/pyinstaller --onefile --name deep-agents main.py
 ```
 
-O executável será gerado em `dist/deep-agents`.
+Saida esperada:
 
-## ⚠️ Notas
+- `dist/deep-agents`
 
-- O executável é específico para Linux x86_64
-- O tamanho do executável é aproximadamente 64MB devido às dependências
-- Todas as variáveis de ambiente do sistema são respeitadas
-- O arquivo `.env` é lido do diretório de trabalho atual
-- Para Windows, o build deve ser feito no Windows
+## Troubleshooting
 
-## 🐛 Troubleshooting
+Permissao:
 
-### Erro de permissão
 ```bash
 chmod +x dist/deep-agents
 ```
 
-### Erro de API key
-Certifique-se de que a variável de ambiente `OPENROUTER_API_KEY` ou `OPENAI_API_KEY` está definida.
+Erro de API key:
 
-### Erro de modelo não encontrado
-Verifique se o nome do modelo está correto e se o provedor está configurado adequadamente.
+- confira `OPENROUTER_API_KEY` ou `OPENAI_API_KEY`
 
-### Executável muito grande
-Isso é normal - o PyInstaller empacota todo o Python e dependências. Considere usar um servidor com o Python instalado se o tamanho for problema.
+Erro de modelo/provider:
+
+- valide `*_PROVIDER` e `*_MODEL`
