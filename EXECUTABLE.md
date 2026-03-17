@@ -26,7 +26,7 @@ Obrigatorias (dependendo do provider):
 Opcionais:
 
 - `PROJECT_ROOT`
-- `THREAD_ID_DEFAULT` (default: `deep-agents-session`)
+- `THREAD_ID_DEFAULT` (default: `helo-ai-cli-session`)
 - `ENABLE_LANGSMITH`
 - `LANGSMITH_API_KEY`
 - `LANGSMITH_PROJECT`
@@ -119,6 +119,15 @@ uv sync
 Saida esperada:
 
 - `dist/deep-agents`
+
+## Lint & Typecheck (local)
+
+Mesmo em modo "executavel", voce pode checar a qualidade do codigo antes de buildar:
+
+```bash
+uv run ruff check .
+uv run mypy --no-incremental .
+```
 
 ## Troubleshooting
 

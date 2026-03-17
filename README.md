@@ -157,6 +157,13 @@ uv run python main.py doctor
 uv run pytest
 ```
 
+## Lint & Typecheck
+
+```bash
+uv run ruff check .
+uv run mypy --no-incremental .
+```
+
 ## Executavel Standalone
 
 Uso do binario pre-build esta documentado em `EXECUTABLE.md`.

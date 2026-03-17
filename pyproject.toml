@@ -9,6 +9,7 @@ dependencies = [
     "langchain-ollama>=0.3.0",
     "langchain-litellm>=0.2.0",
     "pydantic-settings>=2.10.1",
+    "prompt-toolkit>=3.0.52",
     "rich>=14.3.3",
     "typer>=0.16.1",
 ]
@@ -38,6 +39,13 @@ warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_any_generics = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

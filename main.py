@@ -5,18 +5,30 @@ import sys
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, cast
+from uuid import uuid4
 
 import typer
 from deepagents import create_deep_agent
 from deepagents.backends import LocalShellBackend
+from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.styles import Style
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from rich.columns import Columns
 from rich.console import Console
+from rich.padding import Padding
 from rich.panel import Panel
+from rich.text import Text
 
 console = Console()
 error_console = Console(stderr=True)
@@ -25,6 +37,358 @@ app = typer.Typer(help="Helo CLI (AI)", no_args_is_help=True)
 IMPLEMENTER_STOP_TOKEN = "STOP_FOR_COMMIT"
 IMPLEMENTER_DONE_TOKEN = "IMPLEMENTATION_COMPLETE"
 STATUS_EVENT_PREFIX = "__STATUS__::"
+META_CONTEXT_WINDOW_FALLBACK = 128_000
+MAX_CONTEXT_FILE_CHARS = 12_000
+MAX_DIRECTORY_CONTEXT_ITEMS = 60
+EXIT_COMMANDS = {"exit", "quit", "/exit"}
+CHAT_COMMANDS = {"/planner", "/generator", "/implementer", "/clear", "/reset", "/help", "/exit"}
+ROLE_COMMANDS = {"/planner", "/generator", "/implementer"}
+ROLE_ARGUMENT = typer.Argument(..., help="Role to execute manually: planner|generator|implementer")
+PROMPT_ARGUMENT = typer.Argument(..., help="Role prompt.")
+
+
+@dataclass(frozen=True)
+class ContextBuildResult:
+    prompt: str
+    sources: list[str]
+    warnings: list[str]
+
+
+@dataclass
+class ChatSessionMetrics:
+    total_tokens: int = 0
+    last_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class ChatInteractionMetadata:
+    role: str
+    thread_id: str
+    skills_loaded: list[str]
+    sources: list[str]
+    last_tokens: int
+    total_tokens: int
+    context_window: int
+
+
+class ChatCompleter(Completer):
+    def __init__(self, project_root: Path) -> None:
+        self._project_root = project_root
+
+    def get_completions(self, document: Document, complete_event: Any) -> Iterable[Completion]:
+        del complete_event
+        token = _current_input_token(document.text_before_cursor)
+        if not token:
+            return
+
+        if token.startswith("/"):
+            for command in sorted(CHAT_COMMANDS):
+                if command.startswith(token):
+                    yield Completion(
+                        command,
+                        start_position=-len(token),
+                        display=command,
+                        display_meta="command",
+                    )
+            return
+
+        if token.startswith("#"):
+            raw_prefix = token[1:]
+            for candidate in list_context_candidates(self._project_root, raw_prefix):
+                completion_value = f"#{candidate}"
+                yield Completion(
+                    completion_value,
+                    start_position=-len(token),
+                    display=completion_value,
+                    display_meta="context",
+                )
+
+
+def _current_input_token(value: str) -> str:
+    stripped = value.rstrip()
+    if not stripped:
+        return ""
+    parts = stripped.split()
+    return parts[-1] if parts else ""
+
+
+@lru_cache(maxsize=4)
+def _workspace_candidates(project_root: str) -> tuple[str, ...]:
+    root = Path(project_root)
+    candidates: list[str] = []
+    for path in root.rglob("*"):
+        if path == root:
+            continue
+        rel = path.relative_to(root)
+        rel_parts = rel.parts
+        if any(part.startswith(".") for part in rel_parts if part not in {".agents"}):
+            continue
+        display = rel.as_posix()
+        if path.is_dir():
+            display = f"{display}/"
+        candidates.append(display)
+    return tuple(sorted(candidates))
+
+
+def list_context_candidates(project_root: Path, prefix: str, limit: int = 25) -> list[str]:
+    normalized_prefix = prefix.lstrip("./")
+    entries = _workspace_candidates(str(project_root.resolve()))
+    matches = [entry for entry in entries if entry.startswith(normalized_prefix)]
+    return matches[:limit]
+
+
+def estimate_token_count(text: str) -> int:
+    if not text.strip():
+        return 0
+    return max(1, len(text) // 4)
+
+
+def infer_context_window(settings: AppSettings) -> int:
+    configured = [
+        value
+        for value in (
+            settings.planner.max_tokens,
+            settings.generator.max_tokens,
+            settings.implementer.max_tokens,
+        )
+        if value is not None
+    ]
+    return max(configured) if configured else META_CONTEXT_WINDOW_FALLBACK
+
+
+def _normalize_context_ref(raw_ref: str) -> str:
+    return raw_ref.strip().rstrip(",.;:")
+
+
+def extract_context_references(message: str) -> tuple[str, list[str]]:
+    refs: list[str] = []
+    kept_parts: list[str] = []
+    for part in message.split():
+        if part.startswith("#") and len(part) > 1:
+            normalized = _normalize_context_ref(part[1:])
+            if normalized:
+                refs.append(normalized)
+        else:
+            kept_parts.append(part)
+    return " ".join(kept_parts).strip(), refs
+
+
+def _resolve_context_path(project_root: Path, raw_ref: str) -> Path | None:
+    ref_path = Path(raw_ref)
+    candidate = ref_path if ref_path.is_absolute() else (project_root / ref_path)
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(project_root.resolve())
+    except (OSError, ValueError):
+        return None
+    return resolved
+
+
+def _read_file_for_context(path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    if len(text) <= MAX_CONTEXT_FILE_CHARS:
+        return text
+    return (
+        f"{text[:MAX_CONTEXT_FILE_CHARS]}\n"
+        "\n[truncated: file exceeded context limit for inline attachment]"
+    )
+
+
+def _summarize_directory_for_context(path: Path, project_root: Path) -> str:
+    files: list[str] = []
+    for child in sorted(path.rglob("*")):
+        if child.is_file():
+            rel = child.relative_to(project_root).as_posix()
+            files.append(rel)
+        if len(files) >= MAX_DIRECTORY_CONTEXT_ITEMS:
+            break
+    if not files:
+        return "[empty directory]"
+    lines = "\n".join(f"- {file_path}" for file_path in files)
+    if len(files) >= MAX_DIRECTORY_CONTEXT_ITEMS:
+        lines += "\n- ..."
+    return lines
+
+
+def build_contextual_prompt(message: str, project_root: Path) -> ContextBuildResult:
+    cleaned_message, refs = extract_context_references(message)
+    if not refs:
+        return ContextBuildResult(prompt=message, sources=[], warnings=[])
+
+    warnings: list[str] = []
+    sources: list[str] = []
+    context_blocks: list[str] = []
+    seen: set[Path] = set()
+
+    for ref in refs:
+        resolved = _resolve_context_path(project_root, ref)
+        if resolved is None:
+            warnings.append(f"Contexto ignorado (fora do projeto): #{ref}")
+            continue
+        if not resolved.exists():
+            warnings.append(f"Contexto nao encontrado: #{ref}")
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        rel = resolved.relative_to(project_root).as_posix()
+        sources.append(rel)
+        if resolved.is_file():
+            file_context = _read_file_for_context(resolved)
+            context_blocks.append(f"### {rel}\n{file_context}")
+            continue
+        directory_context = _summarize_directory_for_context(resolved, project_root)
+        context_blocks.append(f"### {rel}/\n{directory_context}")
+
+    if not context_blocks:
+        return ContextBuildResult(
+            prompt=cleaned_message or message, sources=sources, warnings=warnings
+        )
+
+    user_prompt = (
+        cleaned_message if cleaned_message else "Use o contexto anexado e responda o pedido."
+    )
+    prompt = (
+        "Contexto adicional fornecido pelo usuario via #:\n\n"
+        + "\n\n".join(context_blocks)
+        + "\n\nPedido do usuario:\n"
+        + user_prompt
+    )
+    return ContextBuildResult(prompt=prompt, sources=sources, warnings=warnings)
+
+
+def build_chat_session_prompt(project_root: Path) -> PromptSession[str]:
+    style = Style.from_dict(
+        {
+            "prompt": "ansibrightcyan bold",
+            "symbol": "ansibrightgreen bold",
+            "hint": "ansibrightblack",
+            "badge": "ansiblue bold",
+        }
+    )
+
+    return PromptSession(
+        completer=ChatCompleter(project_root),
+        complete_while_typing=True,
+        style=style,
+        history=InMemoryHistory(),
+        auto_suggest=AutoSuggestFromHistory(),
+        reserve_space_for_menu=8,
+        bottom_toolbar=HTML(
+            "<badge>[TAB]</badge><hint> autocomplete de </hint>"
+            "<b>/roles</b><hint> e </hint><b>#contexto</b>"
+            "<hint>  |  </hint><badge>[CTRL+C]</badge><hint> sair</hint>"
+            "<hint>  |  comandos: </hint><b>/clear</b><hint>, </hint>"
+            "<b>/reset</b><hint>, </hint><b>/help</b>"
+        ),
+    )
+
+
+def render_chat_header(thread_id: str) -> None:
+    title = Text("Helo AI CLI", style="bold white")
+    subtitle = Text(f"Sessao ativa: {thread_id}", style="cyan")
+    body = Text.assemble(
+        "Chat interativo com pipeline e roles manuais", "\n", "Digite /help para atalhos"
+    )
+    panel = Panel(
+        Padding(Text.assemble(title, "\n", subtitle, "\n\n", body), (0, 1)),
+        border_style="bright_blue",
+        title="Helo AI CLI",
+    )
+    console.print(panel)
+
+
+def render_user_message(message: str, context_sources: list[str]) -> None:
+    source_text = "\n".join(f"- {source}" for source in context_sources)
+    content = message if not context_sources else f"{message}\n\nContext refs:\n{source_text}"
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    console.print()
+    console.print(
+        Panel(
+            content,
+            title=f"You  {timestamp}",
+            border_style="bright_cyan",
+            padding=(0, 1),
+            expand=True,
+        )
+    )
+
+
+def render_assistant_message(response: str, metadata: ChatInteractionMetadata) -> None:
+    context_percent = (
+        (metadata.total_tokens / metadata.context_window) * 100 if metadata.context_window else 0.0
+    )
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    response_panel = Panel(
+        response.strip() or "[empty response]",
+        title=f"Helo AI CLI ({metadata.role})  {timestamp}",
+        border_style="green",
+        padding=(0, 1),
+    )
+
+    skills = "\n".join(metadata.skills_loaded) if metadata.skills_loaded else "(none)"
+    sources = "\n".join(metadata.sources) if metadata.sources else "(none)"
+    meta_panel = Panel(
+        Text.from_markup(
+            "[bold]Session[/]\n"
+            f"{metadata.thread_id}\n\n"
+            "[bold]Skills loaded[/]\n"
+            f"{skills}\n\n"
+            "[bold]Sources used[/]\n"
+            f"{sources}\n\n"
+            "[bold]Tokens[/]\n"
+            f"last={metadata.last_tokens} total={metadata.total_tokens}\n"
+            "[bold]Context window[/]\n"
+            f"{context_percent:.1f}% of {metadata.context_window}"
+        ),
+        title="Metadata",
+        border_style="magenta",
+        padding=(0, 1),
+        width=42,
+    )
+
+    console.print()
+    console.print(Columns([response_panel, meta_panel], expand=True, equal=False))
+
+
+def is_chat_command(message: str, command: str) -> bool:
+    return message.strip().lower() == command
+
+
+def parse_help_text() -> str:
+    return (
+        "Comandos:\n"
+        "- /planner <pedido>\n"
+        "- /generator <pedido>\n"
+        "- /implementer <pedido>\n"
+        "- /clear (limpa a tela)\n"
+        "- /reset (nova sessao limpa)\n"
+        "- /exit\n\n"
+        "Contexto:\n"
+        "- Use #arquivo ou #diretorio para anexar contexto no prompt.\n"
+        "- Digite / e pressione TAB para autocomplete de roles/comandos.\n"
+        "- Digite # e pressione TAB para autocomplete de arquivos/pastas."
+    )
+
+
+def _skills_for_metadata(runtime: AgentRuntime, selected_role: str) -> list[str]:
+    selected: list[str] = []
+    role_map = {
+        "planner": ["builtin:planner_skill.md"],
+        "generator": ["builtin:generator_skill.md"],
+        "implementer": ["builtin:implementer_skill.md"],
+        "pipeline": [
+            "builtin:planner_skill.md",
+            "builtin:generator_skill.md",
+            "builtin:implementer_skill.md",
+        ],
+        "chat": ["builtin:chat-system"],
+    }
+    selected.extend(role_map.get(selected_role, []))
+    skills = getattr(runtime, "skills", [])
+    if isinstance(skills, list):
+        selected.extend(skills)
+    return selected
 
 
 class ModelRole(StrEnum):
@@ -90,7 +454,7 @@ class AppSettings(BaseSettings):
     langsmith_project: str | None = None
 
     project_root: Path = Field(default_factory=lambda: Path.cwd())
-    thread_id_default: str = "deep-agents-session"
+    thread_id_default: str = "helo-ai-cli-session"
     skills_required: bool = False
 
     @property
@@ -103,7 +467,8 @@ class AppSettings(BaseSettings):
         for role in (self.planner, self.generator, self.implementer):
             if role.provider is Provider.OPENROUTER and not self.openrouter_effective_api_key:
                 raise ValueError(
-                    "openrouter_api_key or openai_api_key is required when any role provider is openrouter"
+                    "openrouter_api_key or openai_api_key is required "
+                    "when any role provider is openrouter"
                 )
         if self.enable_langsmith and not os.getenv("LANGSMITH_API_KEY"):
             raise ValueError("LANGSMITH_API_KEY is required when enable_langsmith=true")
@@ -185,7 +550,98 @@ def load_dotenv_into_environ(env_file: Path | None) -> int:
 def get_settings() -> AppSettings:
     env_file = resolve_env_file()
     load_dotenv_into_environ(env_file)
-    return AppSettings(_env_file=env_file if env_file else None)
+    settings_kwargs: dict[str, Any] = {}
+    if env_file is not None:
+        settings_kwargs["_env_file"] = env_file
+    return AppSettings(**settings_kwargs)
+
+
+def _parse_skill_metadata(skill_path: Path) -> tuple[str, str]:
+    """Extract skill name and description from a SKILL.md file.
+
+    The most reliable source is YAML frontmatter (---) with `name` and
+    `description` fields. When frontmatter is absent, fall back to:
+    1) first markdown heading (# ...)
+    2) first non-empty line.
+    """
+
+    try:
+        text = (skill_path / "SKILL.md").read_text(encoding="utf-8")
+    except OSError:
+        return (skill_path.name, "")
+
+    # Remove a leading BOM if present so parsing works consistently
+    text = text.lstrip("\ufeff")
+
+    name = skill_path.name
+    description = ""
+
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        # parse frontmatter
+        fm_lines: list[str] = []
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            fm_lines.append(line)
+        for line in fm_lines:
+            if ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            key = key.strip().lower()
+            val = val.strip().strip("\"'")
+            if key == "name" and val:
+                name = val
+            elif key == "description" and val:
+                description = val
+        if description:
+            return name, description
+
+    # fallback: first heading
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            # take first heading line and strip leading #s
+            heading = stripped.lstrip("#").strip()
+            if heading:
+                name = heading
+                break
+
+    # fallback: first non-heading non-empty line
+    if not description:
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            description = stripped
+            break
+    return name, description
+
+
+def list_skills(project_root: Path) -> list[dict[str, str]]:
+    """List all valid skills found under the .agents directory."""
+
+    skills_dir = project_root / ".agents"
+    if not skills_dir.exists() or not skills_dir.is_dir():
+        return []
+
+    skills: list[dict[str, str]] = []
+    for item in sorted(skills_dir.iterdir(), key=lambda p: p.name):
+        if not item.is_dir():
+            continue
+        skill_md = item / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        name, description = _parse_skill_metadata(item)
+        skills.append(
+            {
+                "id": item.name,
+                "path": f"/.agents/{item.name}/",
+                "name": name,
+                "description": description,
+            }
+        )
+    return skills
 
 
 def discover_skills_source(project_root: Path, required: bool) -> list[str]:
@@ -313,7 +769,8 @@ class AgentRuntime:
         if role is ModelRole.GENERATOR:
             return (
                 "You are the generator role. Convert planner output into a complete implementation "
-                "guide with explicit steps, concrete file-level actions, and verification criteria. "
+                "guide with explicit steps, concrete file-level actions, "
+                "and verification criteria. "
                 "Avoid ambiguity and preserve the planner scope."
             )
         return (
@@ -325,14 +782,18 @@ class AgentRuntime:
     def _implementer_control_rules(self, auto: bool) -> str:
         if auto:
             return (
-                "AUTO MODE: execute all remaining implementation steps continuously without waiting "
+                "AUTO MODE: execute all remaining implementation steps continuously "
+                "without waiting "
                 "for user intervention. Do not emit manual checkpoint pauses. At final completion, "
                 f"include the exact token {IMPLEMENTER_DONE_TOKEN}."
             )
         return (
-            "MANUAL CHECKPOINT MODE: after each STOP & COMMIT checkpoint, stop execution and include "
-            f"the exact token {IMPLEMENTER_STOP_TOKEN} in the response. Then ask the user to review, "
-            "commit, and push manually. Resume only after receiving 'continue'. At final completion, "
+            "MANUAL CHECKPOINT MODE: after each STOP & COMMIT checkpoint, "
+            "stop execution and include "
+            f"the exact token {IMPLEMENTER_STOP_TOKEN} in the response. "
+            "Then ask the user to review, "
+            "commit, and push manually. Resume only after receiving 'continue'. "
+            "At final completion, "
             f"include the exact token {IMPLEMENTER_DONE_TOKEN}."
         )
 
@@ -527,7 +988,8 @@ class AgentRuntime:
         self._emit_status(on_chunk, "Starting implementer phase")
         implementer_prompt = (
             "Execute the implementation plan below in order. Respect STOP & COMMIT checkpoints and "
-            "report progress clearly. Read implementation.md created by previous phases and execute "
+            "report progress clearly. Read implementation.md created by previous phases "
+            "and execute "
             "accordingly.\n\n"
             f"Implementation guide:\n{generator_output}"
         )
@@ -579,7 +1041,8 @@ class AgentRuntime:
             role_prompt = prompt
             if role is ModelRole.GENERATOR:
                 role_prompt = (
-                    "Use the existing plan.md generated by planner to produce implementation.md in the "
+                    "Use the existing plan.md generated by planner to produce "
+                    "implementation.md in the "
                     "same plans/{feature-name} folder.\n\n"
                     f"User request:\n{prompt}"
                 )
@@ -597,7 +1060,8 @@ class AgentRuntime:
         self._emit_status(on_chunk, "\n=== Implementer ===")
         self._emit_status(on_chunk, "Starting implementer phase")
         current_prompt = (
-            "Read implementation.md generated by generator under plans/{feature-name} and execute it "
+            "Read implementation.md generated by generator under plans/{feature-name} "
+            "and execute it "
             "in order.\n\n"
             f"User request:\n{prompt}"
         )
@@ -757,7 +1221,7 @@ def tracing_enabled_context(enabled: bool, project: str | None):  # type: ignore
 @app.command()
 def chat(
     prompt: str | None = typer.Option(default=None, help="Prompt to run once."),
-    thread_id: str = typer.Option(default="deep-agents-session", help="Thread identifier."),
+    thread_id: str = typer.Option(default="helo-ai-cli-session", help="Thread identifier."),
     auto: bool = typer.Option(
         default=False,
         help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
@@ -769,82 +1233,128 @@ def chat(
 ) -> None:
     settings = get_settings()
     runtime = AgentRuntime(settings)
+    metrics = ChatSessionMetrics()
+    context_window = infer_context_window(settings)
+
+    def execute_single_message(message: str, current_thread_id: str) -> str:
+        contextual = build_contextual_prompt(message, settings.project_root)
+        effective_prompt = contextual.prompt
+        effective_on_chunk = build_output_handler(verbose)
+        selected_role = "chat"
+
+        manual_role = parse_manual_role_command(message)
+        if manual_role:
+            role, role_prompt = manual_role
+            selected_role = role.value
+            role_prompt_with_context = build_contextual_prompt(role_prompt, settings.project_root)
+            contextual = role_prompt_with_context
+            runtime.run_manual_role(
+                role=role,
+                prompt=role_prompt_with_context.prompt,
+                thread_id=current_thread_id,
+                auto=auto,
+                request_continue=ask_continue_after_checkpoint if not auto else None,
+                on_chunk=effective_on_chunk,
+            )
+            output = "Execucao de role concluida."
+        elif should_trigger_pipeline(message):
+            selected_role = "pipeline"
+            runtime.run_pipeline(
+                prompt=effective_prompt,
+                thread_id=current_thread_id,
+                auto=auto,
+                request_continue=ask_continue_after_checkpoint if not auto else None,
+                on_chunk=effective_on_chunk,
+            )
+            output = "Pipeline concluido."
+        else:
+            output = runtime.run_chat(
+                prompt=effective_prompt,
+                thread_id=current_thread_id,
+                on_chunk=effective_on_chunk,
+            )
+
+        for warning in contextual.warnings:
+            console.print(f"[yellow]{warning}[/]")
+
+        consumed_tokens = estimate_token_count(message) + estimate_token_count(output)
+        metrics.last_tokens = consumed_tokens
+        metrics.total_tokens += consumed_tokens
+
+        if not verbose and output.strip():
+            render_assistant_message(
+                output,
+                ChatInteractionMetadata(
+                    role=selected_role,
+                    thread_id=current_thread_id,
+                    skills_loaded=_skills_for_metadata(runtime, selected_role),
+                    sources=contextual.sources,
+                    last_tokens=metrics.last_tokens,
+                    total_tokens=metrics.total_tokens,
+                    context_window=context_window,
+                ),
+            )
+        return current_thread_id
 
     with tracing_enabled_context(settings.enable_langsmith, settings.langsmith_project):
-        on_chunk = build_output_handler(verbose)
         if prompt:
-            manual_role = parse_manual_role_command(prompt)
-            if manual_role:
-                role, role_prompt = manual_role
-                runtime.run_manual_role(
-                    role=role,
-                    prompt=role_prompt,
-                    thread_id=thread_id,
-                    auto=auto,
-                    request_continue=ask_continue_after_checkpoint if not auto else None,
-                    on_chunk=on_chunk,
-                )
-            elif should_trigger_pipeline(prompt):
-                runtime.run_pipeline(
-                    prompt=prompt,
-                    thread_id=thread_id,
-                    auto=auto,
-                    request_continue=ask_continue_after_checkpoint if not auto else None,
-                    on_chunk=on_chunk,
-                )
-            else:
-                output = runtime.run_chat(
-                    prompt=prompt,
-                    thread_id=thread_id,
-                    on_chunk=on_chunk,
-                )
-                if not verbose and output.strip():
-                    console.print(output)
+            execute_single_message(prompt, thread_id)
             console.print()
             return
 
-        console.print(Panel("Interactive chat mode. Type 'exit' to stop.", title="Helo CLI (AI)"))
+        current_thread_id = thread_id
+        session = build_chat_session_prompt(settings.project_root)
+        render_chat_header(current_thread_id)
         while True:
-            message = console.input("[bold cyan]> [/]").strip()
-            if message.lower() in {"exit", "quit"}:
+            message = session.prompt(
+                HTML(
+                    "<prompt>╭─ </prompt><symbol>you</symbol><prompt> @ </prompt>"
+                    f"<hint>{current_thread_id}</hint>\n"
+                    "<prompt>╰─❯ </prompt>"
+                )
+            ).strip()
+            if message.lower() in EXIT_COMMANDS:
                 return
             if not message:
                 continue
 
-            manual_role = parse_manual_role_command(message)
-            if manual_role:
-                role, role_prompt = manual_role
-                runtime.run_manual_role(
-                    role=role,
-                    prompt=role_prompt,
-                    thread_id=thread_id,
-                    auto=auto,
-                    request_continue=ask_continue_after_checkpoint if not auto else None,
-                    on_chunk=on_chunk,
+            if is_chat_command(message, "/help"):
+                console.print(Panel(parse_help_text(), title="Ajuda", border_style="bright_blue"))
+                console.print()
+                continue
+
+            if is_chat_command(message, "/clear"):
+                console.clear()
+                render_chat_header(current_thread_id)
+                continue
+
+            if is_chat_command(message, "/reset"):
+                current_thread_id = f"helo-ai-cli-session-{uuid4().hex[:8]}"
+                metrics.total_tokens = 0
+                metrics.last_tokens = 0
+                console.clear()
+                render_chat_header(current_thread_id)
+                console.print(f"Nova sessao iniciada: {current_thread_id}")
+                console.print(
+                    Panel(
+                        f"Nova sessao iniciada: {current_thread_id}",
+                        title="Reset",
+                        border_style="yellow",
+                    )
                 )
-            elif should_trigger_pipeline(message):
-                runtime.run_pipeline(
-                    prompt=message,
-                    thread_id=thread_id,
-                    auto=auto,
-                    request_continue=ask_continue_after_checkpoint if not auto else None,
-                    on_chunk=on_chunk,
-                )
-            else:
-                output = runtime.run_chat(
-                    prompt=message,
-                    thread_id=thread_id,
-                    on_chunk=on_chunk,
-                )
-                if not verbose and output.strip():
-                    console.print(output)
+                continue
+
+            render_user_message(
+                message, build_contextual_prompt(message, settings.project_root).sources
+            )
+            execute_single_message(message, current_thread_id)
             console.print()
 
 
 @app.command()
 def run(
     prompt: str = typer.Argument(..., help="Single prompt execution."),
-    thread_id: str = typer.Option(default="deep-agents-session", help="Thread identifier."),
+    thread_id: str = typer.Option(default="helo-ai-cli-session", help="Thread identifier."),
     auto: bool = typer.Option(
         default=False,
         help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
@@ -890,11 +1400,9 @@ def run(
 
 @app.command("role")
 def role_command(
-    role: ModelRole = typer.Argument(
-        ..., help="Role to execute manually: planner|generator|implementer"
-    ),
-    prompt: str = typer.Argument(..., help="Role prompt."),
-    thread_id: str = typer.Option(default="deep-agents-session", help="Thread identifier."),
+    role: ModelRole = ROLE_ARGUMENT,
+    prompt: str = PROMPT_ARGUMENT,
+    thread_id: str = typer.Option(default="helo-ai-cli-session", help="Thread identifier."),
     auto: bool = typer.Option(
         default=False,
         help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
@@ -957,6 +1465,7 @@ def skills(action: Annotated[str | None, typer.Argument()] = None) -> None:
     payload = {
         "sources": discover_skills_source(settings.project_root, settings.skills_required),
         "skills_required": settings.skills_required,
+        "skills": list_skills(settings.project_root),
     }
     console.print_json(data=payload)
 

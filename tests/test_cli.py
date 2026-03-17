@@ -1,4 +1,6 @@
-﻿import pytest
+﻿import json
+
+import pytest
 from typer.testing import CliRunner
 
 import main
@@ -19,11 +21,21 @@ def test_skills_command(monkeypatch: pytest.MonkeyPatch) -> None:
     result = runner.invoke(app, ["skills"])
     assert result.exit_code == 0
 
+    payload = json.loads(result.stdout)
+    assert payload["skills_required"] is False
+    assert isinstance(payload.get("skills"), list)
+    assert any(skill.get("id") == "code-review" for skill in payload["skills"])
+
 
 def test_skills_list_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     result = runner.invoke(app, ["skills", "list"])
     assert result.exit_code == 0
+
+    payload = json.loads(result.stdout)
+    assert payload["skills_required"] is False
+    assert isinstance(payload.get("skills"), list)
+    assert any(skill.get("id") == "code-review" for skill in payload["skills"])
 
 
 def _litellm_settings() -> AppSettings:
