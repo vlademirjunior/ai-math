@@ -20,7 +20,7 @@ def _settings(tmp_path: Path) -> AppSettings:
     )
 
 
-def test_pipeline_runs_all_phases_and_writes_artifacts(monkeypatch, tmp_path: Path) -> None:
+def test_pipeline_runs_all_phases(monkeypatch, tmp_path: Path) -> None:
     runtime = AgentRuntime(_settings(tmp_path))
 
     implementer_calls = {"count": 0}
@@ -46,11 +46,7 @@ def test_pipeline_runs_all_phases_and_writes_artifacts(monkeypatch, tmp_path: Pa
         on_chunk=None,
     )
 
-    plan_file = tmp_path / "plans" / "implement-feature" / "plan.md"
-    implementation_file = tmp_path / "plans" / "implement-feature" / "implementation.md"
-    assert generated_files == [plan_file, implementation_file]
-    assert plan_file.exists()
-    assert implementation_file.exists()
+    assert generated_files == []
     assert implementer_calls["count"] == 2
 
 
@@ -74,4 +70,4 @@ def test_pipeline_auto_mode_runs_implementer_once(monkeypatch, tmp_path: Path) -
     )
 
     assert calls.count(ModelRole.IMPLEMENTER) == 1
-    assert len(generated_files) == 2
+    assert generated_files == []

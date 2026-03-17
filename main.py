@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -25,6 +24,7 @@ app = typer.Typer(help="Helo", no_args_is_help=True)
 
 IMPLEMENTER_STOP_TOKEN = "STOP_FOR_COMMIT"
 IMPLEMENTER_DONE_TOKEN = "IMPLEMENTATION_COMPLETE"
+STATUS_EVENT_PREFIX = "__STATUS__::"
 
 
 class ModelRole(StrEnum):
@@ -278,87 +278,6 @@ class AgentRuntime:
             settings.project_root, required=settings.skills_required
         )
 
-    def _plans_root(self) -> Path:
-        root = self.settings.project_root / "plans"
-        root.mkdir(parents=True, exist_ok=True)
-        return root
-
-    def _thread_state_dir(self) -> Path:
-        state_dir = self._plans_root() / ".state"
-        state_dir.mkdir(parents=True, exist_ok=True)
-        return state_dir
-
-    @staticmethod
-    def _slugify(value: str) -> str:
-        cleaned = re.sub(r"[^a-zA-Z0-9\s_-]", " ", value).strip().lower()
-        slug = re.sub(r"[\s_]+", "-", cleaned)
-        slug = re.sub(r"-+", "-", slug).strip("-")
-        return slug or "feature"
-
-    def _feature_from_prompt(self, prompt: str) -> str:
-        stripped = prompt.strip()
-        if stripped.startswith("/"):
-            pieces = stripped.split(maxsplit=1)
-            stripped = pieces[1] if len(pieces) > 1 else ""
-        return self._slugify(stripped)[:80]
-
-    def _set_thread_feature(self, thread_id: str, feature: str) -> None:
-        state_file = self._thread_state_dir() / f"{self._slugify(thread_id)}.txt"
-        state_file.write_text(feature, encoding="utf-8")
-
-    def _get_thread_feature(self, thread_id: str) -> str | None:
-        state_file = self._thread_state_dir() / f"{self._slugify(thread_id)}.txt"
-        if not state_file.exists():
-            return None
-        try:
-            value = state_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            return None
-        return value or None
-
-    def _feature_dir(self, feature: str) -> Path:
-        feature_dir = self._plans_root() / self._slugify(feature)
-        feature_dir.mkdir(parents=True, exist_ok=True)
-        return feature_dir
-
-    def _plan_file(self, feature: str) -> Path:
-        return self._feature_dir(feature) / "plan.md"
-
-    def _implementation_file(self, feature: str) -> Path:
-        return self._feature_dir(feature) / "implementation.md"
-
-    def _latest_feature_with_file(self, filename: str) -> str | None:
-        candidates: list[tuple[float, str]] = []
-        for item in self._plans_root().iterdir():
-            if not item.is_dir() or item.name.startswith("."):
-                continue
-            file_path = item / filename
-            if file_path.exists() and file_path.is_file():
-                candidates.append((file_path.stat().st_mtime, item.name))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda pair: pair[0], reverse=True)
-        return candidates[0][1]
-
-    def _resolve_feature(
-        self, thread_id: str, prompt: str, *, require_file: str | None = None
-    ) -> str:
-        candidate = self._get_thread_feature(thread_id) or self._feature_from_prompt(prompt)
-
-        if require_file is None:
-            return candidate
-
-        candidate_file = self._feature_dir(candidate) / require_file
-        if candidate_file.exists():
-            return candidate
-
-        latest = self._latest_feature_with_file(require_file)
-        if latest:
-            self._set_thread_feature(thread_id, latest)
-            return latest
-
-        raise FileNotFoundError(f"No {require_file} found under plans/. Run planner first.")
-
     def _builtin_skill_path(self, role: ModelRole) -> Path:
         skill_name = {
             ModelRole.PLANNER: "planner_skill.md",
@@ -433,8 +352,62 @@ class AgentRuntime:
         if isinstance(chunk, str):
             return chunk
         if isinstance(chunk, dict):
-            return str(chunk)
-        return str(chunk)
+            return AgentRuntime._extract_assistant_text_from_chunk(chunk)
+        return ""
+
+    @staticmethod
+    def _extract_assistant_text_from_chunk(chunk: dict[str, Any]) -> str:
+        texts: list[str] = []
+
+        def extract_messages(container: Any) -> None:
+            if not isinstance(container, list):
+                return
+            for message in container:
+                text = AgentRuntime._assistant_message_to_text(message)
+                if text:
+                    texts.append(text)
+
+        if "messages" in chunk:
+            extract_messages(chunk.get("messages"))
+
+        for key in ("model", "agent", "output"):
+            value = chunk.get(key)
+            if isinstance(value, dict):
+                extract_messages(value.get("messages"))
+
+        return "".join(texts)
+
+    @staticmethod
+    def _assistant_message_to_text(message: Any) -> str:
+        message_type = getattr(message, "type", None)
+        class_name = type(message).__name__.lower()
+        is_assistant = message_type == "ai" or "aimessage" in class_name
+
+        if isinstance(message, dict):
+            role = str(message.get("role", "")).lower()
+            is_assistant = role in {"assistant", "ai"}
+            content = message.get("content")
+            return AgentRuntime._content_to_text(content) if is_assistant else ""
+
+        if not is_assistant:
+            return ""
+
+        return AgentRuntime._content_to_text(getattr(message, "content", None))
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                parts.append(AgentRuntime._content_to_text(item))
+            return "".join(parts)
+        if isinstance(content, dict):
+            text = content.get("text")
+            if isinstance(text, str):
+                return text
+        return ""
 
     def create_role_agent(self, role: ModelRole, auto: bool = False) -> Any:
         role_model = self.model_factory.create(role)
@@ -508,6 +481,11 @@ class AgentRuntime:
     def _contains_token(output: str, token: str) -> bool:
         return token in output
 
+    @staticmethod
+    def _emit_status(on_chunk: Callable[[str], None] | None, message: str) -> None:
+        if on_chunk is not None:
+            on_chunk(f"{STATUS_EVENT_PREFIX}{message}")
+
     def run_pipeline(
         self,
         prompt: str,
@@ -517,11 +495,8 @@ class AgentRuntime:
         request_continue: Callable[[], bool] | None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> list[Path]:
-        generated_files: list[Path] = []
-
-        feature = self._feature_from_prompt(prompt)
-        self._set_thread_feature(thread_id, feature)
-
+        self._emit_status(on_chunk, "\n=== Planner ===")
+        self._emit_status(on_chunk, "Starting planner phase")
         planner_output = self.run_role(
             role=ModelRole.PLANNER,
             prompt=prompt,
@@ -529,13 +504,14 @@ class AgentRuntime:
             auto=auto,
             on_chunk=on_chunk,
         )
-        plan_path = self._plan_file(feature)
-        plan_path.write_text(planner_output, encoding="utf-8")
-        generated_files.append(plan_path)
+        self._emit_status(on_chunk, "Planner phase completed")
 
+        self._emit_status(on_chunk, "\n=== Generator ===")
+        self._emit_status(on_chunk, "Starting generator phase")
         generator_prompt = (
             "Use the planner output below to generate a complete implementation plan with explicit "
-            "verification checkpoints.\n\n"
+            "verification checkpoints. Create/update files under plans/{feature-name} as needed "
+            "according to your role instructions.\n\n"
             f"User request:\n{prompt}\n\nPlanner output:\n{planner_output}"
         )
         generator_output = self.run_role(
@@ -545,16 +521,19 @@ class AgentRuntime:
             auto=auto,
             on_chunk=on_chunk,
         )
-        implementation_path = self._implementation_file(feature)
-        implementation_path.write_text(generator_output, encoding="utf-8")
-        generated_files.append(implementation_path)
+        self._emit_status(on_chunk, "Generator phase completed")
 
+        self._emit_status(on_chunk, "\n=== Implementer ===")
+        self._emit_status(on_chunk, "Starting implementer phase")
         implementer_prompt = (
             "Execute the implementation plan below in order. Respect STOP & COMMIT checkpoints and "
-            "report progress clearly.\n\n"
-            f"Implementation guide from {implementation_path}:\n{generator_output}"
+            "report progress clearly. Read implementation.md created by previous phases and execute "
+            "accordingly.\n\n"
+            f"Implementation guide:\n{generator_output}"
         )
+        step = 1
         while True:
+            self._emit_status(on_chunk, f"Implementer step {step} running")
             implementer_output = self.run_role(
                 role=ModelRole.IMPLEMENTER,
                 prompt=implementer_prompt,
@@ -564,20 +543,25 @@ class AgentRuntime:
             )
 
             if auto or self._contains_token(implementer_output, IMPLEMENTER_DONE_TOKEN):
+                self._emit_status(on_chunk, "Implementer phase completed")
                 break
 
             if not self._contains_token(implementer_output, IMPLEMENTER_STOP_TOKEN):
+                self._emit_status(on_chunk, "Implementer finished without STOP token")
                 break
 
             if request_continue is None:
+                self._emit_status(on_chunk, "Implementer paused: no continue handler")
                 break
 
             if not request_continue():
+                self._emit_status(on_chunk, "Implementer paused by user")
                 break
 
             implementer_prompt = "continue"
+            step += 1
 
-        return generated_files
+        return []
 
     def run_manual_role(
         self,
@@ -589,58 +573,37 @@ class AgentRuntime:
         request_continue: Callable[[], bool] | None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> list[Path]:
-        feature = self._resolve_feature(
-            thread_id,
-            prompt,
-            require_file="plan.md" if role is ModelRole.GENERATOR else None,
-        )
-        if role is ModelRole.PLANNER:
-            output = self.run_role(
+        if role is not ModelRole.IMPLEMENTER:
+            self._emit_status(on_chunk, f"\n=== {role.value.capitalize()} ===")
+            self._emit_status(on_chunk, f"Starting {role.value} phase")
+            role_prompt = prompt
+            if role is ModelRole.GENERATOR:
+                role_prompt = (
+                    "Use the existing plan.md generated by planner to produce implementation.md in the "
+                    "same plans/{feature-name} folder.\n\n"
+                    f"User request:\n{prompt}"
+                )
+            self.run_role(
                 role=role,
-                prompt=prompt,
+                prompt=role_prompt,
                 thread_id=thread_id,
                 auto=auto,
                 on_chunk=on_chunk,
             )
-            self._set_thread_feature(thread_id, feature)
-            plan_path = self._plan_file(feature)
-            plan_path.write_text(output, encoding="utf-8")
-            return [plan_path]
+            self._emit_status(on_chunk, f"{role.value.capitalize()} phase completed")
+            return []
 
-        if role is ModelRole.GENERATOR:
-            plan_path = self._plan_file(feature)
-            if not plan_path.exists():
-                raise FileNotFoundError("No plan.md found. Run planner first.")
-            plan_text = plan_path.read_text(encoding="utf-8")
-            generator_prompt = (
-                "Generate implementation.md from the plan below.\n\n"
-                f"User request:\n{prompt}\n\nPlan file ({plan_path}):\n{plan_text}"
-            )
-            output = self.run_role(
-                role=role,
-                prompt=generator_prompt,
-                thread_id=thread_id,
-                auto=auto,
-                on_chunk=on_chunk,
-            )
-            implementation_path = self._implementation_file(feature)
-            implementation_path.write_text(output, encoding="utf-8")
-            self._set_thread_feature(thread_id, feature)
-            return [implementation_path]
-
-        implementation_feature = self._resolve_feature(
-            thread_id, prompt, require_file="implementation.md"
-        )
-        implementation_path = self._implementation_file(implementation_feature)
-        implementation_text = implementation_path.read_text(encoding="utf-8")
-
-        outputs: list[Path] = [implementation_path]
+        outputs: list[Path] = []
+        self._emit_status(on_chunk, "\n=== Implementer ===")
+        self._emit_status(on_chunk, "Starting implementer phase")
         current_prompt = (
-            "Execute the implementation guide below in order.\n\n"
-            f"User request:\n{prompt}\n\nImplementation guide ({implementation_path}):\n"
-            f"{implementation_text}"
+            "Read implementation.md generated by generator under plans/{feature-name} and execute it "
+            "in order.\n\n"
+            f"User request:\n{prompt}"
         )
+        step = 1
         while True:
+            self._emit_status(on_chunk, f"Implementer step {step} running")
             output = self.run_role(
                 role=ModelRole.IMPLEMENTER,
                 prompt=current_prompt,
@@ -650,15 +613,20 @@ class AgentRuntime:
             )
 
             if auto:
+                self._emit_status(on_chunk, "Implementer phase completed")
                 break
             if self._contains_token(output, IMPLEMENTER_DONE_TOKEN):
+                self._emit_status(on_chunk, "Implementer phase completed")
                 break
             if not self._contains_token(output, IMPLEMENTER_STOP_TOKEN):
+                self._emit_status(on_chunk, "Implementer finished without STOP token")
                 break
             if request_continue is None or not request_continue():
+                self._emit_status(on_chunk, "Implementer paused by user")
                 break
 
             current_prompt = "continue"
+            step += 1
 
         return outputs
 
@@ -750,6 +718,18 @@ def ask_continue_after_checkpoint() -> bool:
         console.print("Type 'continue' or 'stop'.")
 
 
+def build_output_handler(verbose: bool) -> Callable[[str], None]:
+    def handler(text: str) -> None:
+        if text.startswith(STATUS_EVENT_PREFIX):
+            message = text[len(STATUS_EVENT_PREFIX) :]
+            console.print(f"[bold cyan]{message}[/]")
+            return
+        if verbose and text:
+            console.print(text, end="")
+
+    return handler
+
+
 @contextmanager
 def noop_context():  # type: ignore[no-untyped-def]
     yield
@@ -782,11 +762,16 @@ def chat(
         default=False,
         help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
     ),
+    verbose: bool = typer.Option(
+        default=False,
+        help="When enabled, prints intermediate streaming logs from model/tool execution.",
+    ),
 ) -> None:
     settings = get_settings()
     runtime = AgentRuntime(settings)
 
     with tracing_enabled_context(settings.enable_langsmith, settings.langsmith_project):
+        on_chunk = build_output_handler(verbose)
         if prompt:
             manual_role = parse_manual_role_command(prompt)
             if manual_role:
@@ -797,7 +782,7 @@ def chat(
                     thread_id=thread_id,
                     auto=auto,
                     request_continue=ask_continue_after_checkpoint if not auto else None,
-                    on_chunk=lambda t: console.print(t, end=""),
+                    on_chunk=on_chunk,
                 )
             elif should_trigger_pipeline(prompt):
                 runtime.run_pipeline(
@@ -805,14 +790,16 @@ def chat(
                     thread_id=thread_id,
                     auto=auto,
                     request_continue=ask_continue_after_checkpoint if not auto else None,
-                    on_chunk=lambda t: console.print(t, end=""),
+                    on_chunk=on_chunk,
                 )
             else:
-                runtime.run_chat(
+                output = runtime.run_chat(
                     prompt=prompt,
                     thread_id=thread_id,
-                    on_chunk=lambda t: console.print(t, end=""),
+                    on_chunk=on_chunk,
                 )
+                if not verbose and output.strip():
+                    console.print(output)
             console.print()
             return
 
@@ -833,7 +820,7 @@ def chat(
                     thread_id=thread_id,
                     auto=auto,
                     request_continue=ask_continue_after_checkpoint if not auto else None,
-                    on_chunk=lambda t: console.print(t, end=""),
+                    on_chunk=on_chunk,
                 )
             elif should_trigger_pipeline(message):
                 runtime.run_pipeline(
@@ -841,14 +828,16 @@ def chat(
                     thread_id=thread_id,
                     auto=auto,
                     request_continue=ask_continue_after_checkpoint if not auto else None,
-                    on_chunk=lambda t: console.print(t, end=""),
+                    on_chunk=on_chunk,
                 )
             else:
-                runtime.run_chat(
+                output = runtime.run_chat(
                     prompt=message,
                     thread_id=thread_id,
-                    on_chunk=lambda t: console.print(t, end=""),
+                    on_chunk=on_chunk,
                 )
+                if not verbose and output.strip():
+                    console.print(output)
             console.print()
 
 
@@ -860,10 +849,15 @@ def run(
         default=False,
         help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
     ),
+    verbose: bool = typer.Option(
+        default=False,
+        help="When enabled, prints intermediate streaming logs from model/tool execution.",
+    ),
 ) -> None:
     settings = get_settings()
     runtime = AgentRuntime(settings)
     with tracing_enabled_context(settings.enable_langsmith, settings.langsmith_project):
+        on_chunk = build_output_handler(verbose)
         manual_role = parse_manual_role_command(prompt)
         if manual_role:
             role, role_prompt = manual_role
@@ -873,7 +867,7 @@ def run(
                 thread_id=thread_id,
                 auto=auto,
                 request_continue=ask_continue_after_checkpoint if not auto else None,
-                on_chunk=lambda t: console.print(t, end=""),
+                on_chunk=on_chunk,
             )
         elif should_trigger_pipeline(prompt):
             runtime.run_pipeline(
@@ -881,14 +875,16 @@ def run(
                 thread_id=thread_id,
                 auto=auto,
                 request_continue=ask_continue_after_checkpoint if not auto else None,
-                on_chunk=lambda t: console.print(t, end=""),
+                on_chunk=on_chunk,
             )
         else:
-            runtime.run_chat(
+            output = runtime.run_chat(
                 prompt=prompt,
                 thread_id=thread_id,
-                on_chunk=lambda t: console.print(t, end=""),
+                on_chunk=on_chunk,
             )
+            if not verbose and output.strip():
+                console.print(output)
         console.print()
 
 
@@ -903,10 +899,15 @@ def role_command(
         default=False,
         help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
     ),
+    verbose: bool = typer.Option(
+        default=False,
+        help="When enabled, prints intermediate streaming logs from model/tool execution.",
+    ),
 ) -> None:
     settings = get_settings()
     runtime = AgentRuntime(settings)
     with tracing_enabled_context(settings.enable_langsmith, settings.langsmith_project):
+        on_chunk = build_output_handler(verbose)
         runtime.run_manual_role(
             role=role,
             prompt=prompt,
@@ -915,7 +916,7 @@ def role_command(
             request_continue=ask_continue_after_checkpoint
             if (role is ModelRole.IMPLEMENTER and not auto)
             else None,
-            on_chunk=lambda t: console.print(t, end=""),
+            on_chunk=on_chunk,
         )
         console.print()
 

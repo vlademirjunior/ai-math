@@ -42,7 +42,7 @@ Config por role:
 ### 1. Pipeline automatico por orquestracao
 
 - planner -> generator -> implementer
-- cria `plans/{feature-name}/plan.md` e `plans/{feature-name}/implementation.md`
+- planner/generator devem criar `plans/{feature-name}/plan.md` e `plans/{feature-name}/implementation.md`
 - implementer le `implementation.md` para executar
 
 ### 2. Conversa natural

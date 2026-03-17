@@ -16,7 +16,7 @@ Fluxo de engenharia (quando acionado):
 2. generator
 3. implementer
 
-Arquivos salvos em `plans/{feature-name}/`:
+Arquivos esperados em `plans/{feature-name}/` (criados pelos roles via tools do deep agent):
 
 - `plan.md` (saida do planner)
 - `implementation.md` (saida do generator)
@@ -64,11 +64,11 @@ Importante:
 
 ## Fluxo de Arquivos (plans)
 
-1. Planner roda e cria `plans/{feature-name}/plan.md`.
-2. Generator roda e cria `plans/{feature-name}/implementation.md`.
+1. Planner deve criar `plans/{feature-name}/plan.md`.
+2. Generator deve criar `plans/{feature-name}/implementation.md`.
 3. Implementer sempre usa `implementation.md` para implementar.
 
-O `feature-name` eh derivado do prompt (slug) e mantido por `thread_id` para as proximas etapas.
+O nome da pasta deve vir da estrategia do planner/skills e nao de criacao manual no runtime.
 
 ## Requisitos
 
