@@ -1,7 +1,7 @@
-# Claude-Code-Like Deep Agents CLI (Python)
+# Claude-Code-Like Helo (Python)
 
 ## Goal
-Deliver a secure, production-ready single-file Deep Agents CLI with role-based model orchestration, .agents skill loading, optional default-off LangSmith tracing, and strict quality gates.
+Deliver a secure, production-ready single-file Helo with role-based model orchestration, .agents skill loading, optional default-off LangSmith tracing, and strict quality gates.
 
 ## Prerequisites
 Make sure that the use is currently on the `claude-code-cli-langchain` branch before beginning implementation.
@@ -629,7 +629,7 @@ def noop_context() -> Iterator[None]:
 
 
 def run_interactive(runtime: AgentRuntime, thread_id: str) -> int:
-    print("Deep Agents CLI")
+    print("Helo")
     print("Type 'exit' or 'quit' to stop.")
 
     while True:
@@ -912,7 +912,7 @@ def noop_context() -> Iterator[None]:
 
 
 def run_interactive(runtime: AgentRuntime, thread_id: str) -> int:
-    print("Deep Agents CLI")
+    print("Helo")
     print("Type 'exit' or 'quit' to stop.")
 
     while True:
@@ -980,7 +980,7 @@ def test_valid_skills_tree(tmp_path: Path) -> None:
 - [ ] Copy and paste code below into `README.md`:
 
 ```md
-# Claude-Code-Like Deep Agents CLI
+# Claude-Code-Like Helo
 
 ## Skills Folder
 
@@ -1042,7 +1042,7 @@ from rich.panel import Panel
 
 console = Console()
 error_console = Console(stderr=True)
-app = typer.Typer(help="Deep Agents CLI", no_args_is_help=True)
+app = typer.Typer(help="Helo", no_args_is_help=True)
 
 
 class ModelRole(str, Enum):
@@ -1247,7 +1247,7 @@ def chat(
         console.print()
         return
 
-    console.print(Panel("Interactive chat mode. Type 'exit' to stop.", title="Deep Agents CLI"))
+    console.print(Panel("Interactive chat mode. Type 'exit' to stop.", title="Helo"))
     while True:
         message = console.input("[bold cyan]> [/]").strip()
         if message.lower() in {"exit", "quit"}:
@@ -1339,7 +1339,7 @@ def test_skills_command() -> None:
 - [ ] Copy and paste code below into `README.md`:
 
 ```md
-# Claude-Code-Like Deep Agents CLI
+# Claude-Code-Like Helo
 
 ## Install
 
@@ -1401,7 +1401,7 @@ from rich.panel import Panel
 
 
 console = Console()
-app = typer.Typer(help="Deep Agents CLI", no_args_is_help=True)
+app = typer.Typer(help="Helo", no_args_is_help=True)
 
 
 class ModelRole(str, Enum):
@@ -1625,7 +1625,7 @@ def chat(
             console.print()
             return
 
-        console.print(Panel("Interactive chat mode. Type 'exit' to stop.", title="Deep Agents CLI"))
+        console.print(Panel("Interactive chat mode. Type 'exit' to stop.", title="Helo"))
         while True:
             message = console.input("[bold cyan]> [/]").strip()
             if message.lower() in {"exit", "quit"}:
@@ -1718,7 +1718,7 @@ def test_tracing_enabled_sets_env_true(monkeypatch) -> None:
 - [ ] Copy and paste code below into `README.md`:
 
 ```md
-# Claude-Code-Like Deep Agents CLI
+# Claude-Code-Like Helo
 
 ## Tracing (default off)
 
@@ -1788,9 +1788,9 @@ uv run python main.py doctor
 - [x] Copy and paste code below into `README.md`:
 
 ```md
-# Claude-Code-Like Deep Agents CLI (Python)
+# Claude-Code-Like Helo (Python)
 
-Production-ready Deep Agents CLI with:
+Production-ready Helo with:
 - Role-based model orchestration (`planner`, `generator`, `implementer`)
 - Skills loading from `.agents/`
 - Optional LangSmith tracing (default disabled)

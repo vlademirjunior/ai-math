@@ -104,3 +104,29 @@ uv run python main.py skills
 ## Non-interactive usage
 
 Use `run` or `chat --prompt` in CI scripts for deterministic single-shot execution.
+
+## 🚀 Executável Standalone
+
+Você também pode usar o executável pré-construído que não requer Python instalado:
+
+```bash
+# Usar o executável diretamente
+./dist/deep-agents doctor
+./dist/deep-agents chat
+./dist/deep-agents run "Sua tarefa aqui"
+```
+
+O executável lê variáveis de ambiente ou arquivo `.env` da mesma forma que a versão Python. Veja `EXECUTABLE.md` para instruções completas.
+
+### Configuração Rápida
+
+```bash
+# Copie o exemplo de .env
+cp .env.example .env
+
+# Edite o arquivo .env com sua API key do OpenRouter
+# Em seguida, execute:
+./dist/deep-agents doctor
+```
+
+Para mais detalhes sobre como usar o executável, consulte [EXECUTABLE.md](EXECUTABLE.md).

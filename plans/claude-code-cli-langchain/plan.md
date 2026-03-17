@@ -1,4 +1,4 @@
-﻿# Claude-Code-Like Deep Agents CLI (Python)
+﻿# Claude-Code-Like Helo (Python)
 # Use Docs by LangChain MCP Tool when necessary
 **Description:** Build a production-ready Python CLI inspired by Claude Code, using LangChain Deep Agents with skills from .agents/, three model roles (planner/generator/implementer), optional LangSmith tracing (default off), and a quality-first toolchain (uv, ruff, mypy, pytest).
 
@@ -134,5 +134,5 @@ Deliver a secure, production-ready single-file Python CLI that uses Deep Agents 
 3. Do you want `.agents/` to be mandatory (hard error if missing) or optional (warn and continue without skills)?
 4. Should we support one shared model across multiple roles when env vars are partially configured, or require all three roles explicitly?
 5. For LangSmith, do you want only env-based toggling, or also a CLI flag that overrides env at runtime?
-6. Should the CLI include an approval mode for shell/file-destructive actions similar to Deep Agents CLI interrupt controls by default?
+6. Should the CLI include an approval mode for shell/file-destructive actions similar to Helo interrupt controls by default?
 7. Do you want a strict Python version target (e.g., 3.11+ per Deep Agents docs) or keep current project target (3.13+)?

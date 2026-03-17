@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 import typer
 from deepagents import create_deep_agent
@@ -19,7 +20,7 @@ from rich.panel import Panel
 
 console = Console()
 error_console = Console(stderr=True)
-app = typer.Typer(help="Deep Agents CLI", no_args_is_help=True)
+app = typer.Typer(help="Helo", no_args_is_help=True)
 
 
 class ModelRole(StrEnum):
@@ -35,7 +36,7 @@ class Provider(StrEnum):
 
 
 class RoleModelConfig(BaseModel):
-    provider: Provider
+    provider: Provider = Provider.OPENROUTER
     model: str
     temperature: float = 0.0
     max_tokens: int | None = None
@@ -52,6 +53,7 @@ class AppSettings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
+        nested_model_default_partial_update=True,
         extra="ignore",
     )
 
@@ -71,13 +73,14 @@ class AppSettings(BaseSettings):
     )
     implementer: RoleModelConfig = Field(
         default_factory=lambda: RoleModelConfig(
-            provider=Provider.OLLAMA,
+            provider=Provider.OPENROUTER,
             model="stepfun/step-3.5-flash:free",
             temperature=0.0,
         )
     )
 
     openrouter_api_key: str | None = None
+    openai_api_key: str | None = None
     ollama_base_url: str = "http://localhost:11434"
     enable_langsmith: bool = False
     langsmith_project: str | None = None
@@ -86,12 +89,17 @@ class AppSettings(BaseSettings):
     thread_id_default: str = "deep-agents-session"
     skills_required: bool = False
 
+    @property
+    def openrouter_effective_api_key(self) -> str | None:
+        # OpenRouter accepts OpenAI-compatible keys; keep backwards compatibility.
+        return self.openrouter_api_key or self.openai_api_key
+
     @model_validator(mode="after")
     def validate_provider_credentials(self) -> AppSettings:
         for role in (self.planner, self.generator, self.implementer):
-            if role.provider is Provider.OPENROUTER and not self.openrouter_api_key:
+            if role.provider is Provider.OPENROUTER and not self.openrouter_effective_api_key:
                 raise ValueError(
-                    "openrouter_api_key is required when any role provider is openrouter"
+                    "openrouter_api_key or openai_api_key is required when any role provider is openrouter"
                 )
         if self.enable_langsmith and not os.getenv("LANGSMITH_API_KEY"):
             raise ValueError("LANGSMITH_API_KEY is required when enable_langsmith=true")
@@ -99,8 +107,81 @@ class AppSettings(BaseSettings):
 
 
 @lru_cache(maxsize=1)
+def resolve_env_file() -> Path | None:
+    candidates: list[Path] = [Path.cwd() / ".env"]
+    project_root = os.getenv("PROJECT_ROOT")
+    if project_root:
+        candidates.append(Path(project_root).expanduser() / ".env")
+
+    # When frozen with PyInstaller, look next to the executable as well.
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / ".env")
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        normalized = candidate.resolve()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if normalized.exists() and normalized.is_file():
+            return normalized
+    return None
+
+
+def parse_dotenv_line(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+
+    if stripped.startswith("export "):
+        stripped = stripped[len("export ") :].lstrip()
+
+    if "=" not in stripped:
+        return None
+
+    key, value = stripped.split("=", 1)
+    key = key.strip().lstrip("\ufeff")
+    value = value.strip()
+    if not key:
+        return None
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1]
+    elif " #" in value:
+        value = value.split(" #", 1)[0].rstrip()
+
+    return key, value
+
+
+def load_dotenv_into_environ(env_file: Path | None) -> int:
+    if env_file is None:
+        return 0
+
+    loaded = 0
+    try:
+        lines = env_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+
+    for line in lines:
+        parsed = parse_dotenv_line(line)
+        if parsed is None:
+            continue
+        key, value = parsed
+        existing = os.environ.get(key)
+        if existing is not None and existing.strip() != "":
+            continue
+        os.environ[key] = value
+        loaded += 1
+
+    return loaded
+
+
+@lru_cache(maxsize=1)
 def get_settings() -> AppSettings:
-    return AppSettings()
+    env_file = resolve_env_file()
+    load_dotenv_into_environ(env_file)
+    return AppSettings(_env_file=env_file if env_file else None)
 
 
 def discover_skills_source(project_root: Path, required: bool) -> list[str]:
@@ -149,8 +230,8 @@ class ModelFactory:
             return ChatOpenRouter(
                 model=config.model,
                 api_key=(
-                    SecretStr(self._settings.openrouter_api_key)
-                    if self._settings.openrouter_api_key
+                    SecretStr(self._settings.openrouter_effective_api_key)
+                    if self._settings.openrouter_effective_api_key
                     else None
                 ),
                 temperature=config.temperature,
@@ -254,7 +335,7 @@ def chat(
             console.print()
             return
 
-        console.print(Panel("Interactive chat mode. Type 'exit' to stop.", title="Deep Agents CLI"))
+        console.print(Panel("Interactive chat mode. Type 'exit' to stop.", title="Helo"))
         while True:
             message = console.input("[bold cyan]> [/]").strip()
             if message.lower() in {"exit", "quit"}:
@@ -282,8 +363,12 @@ def run(
 @app.command()
 def doctor() -> None:
     settings = get_settings()
+    env_file = resolve_env_file()
     checks = {
         "openrouter_api_key": bool(settings.openrouter_api_key),
+        "openai_api_key": bool(settings.openai_api_key),
+        "openrouter_effective_api_key": bool(settings.openrouter_effective_api_key),
+        "dotenv_path": str(env_file) if env_file else None,
         "skills_source": discover_skills_source(settings.project_root, settings.skills_required),
         "langsmith_enabled": settings.enable_langsmith,
         "langsmith_env": os.getenv("LANGSMITH_TRACING", "false"),
@@ -303,7 +388,10 @@ def models() -> None:
 
 
 @app.command()
-def skills() -> None:
+def skills(action: Annotated[str | None, typer.Argument()] = None) -> None:
+    if action not in (None, "list"):
+        raise typer.BadParameter("unexpected extra argument")
+
     settings = get_settings()
     payload = {
         "sources": discover_skills_source(settings.project_root, settings.skills_required),
