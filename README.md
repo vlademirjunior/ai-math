@@ -1,132 +1,162 @@
-﻿Para dominar o **uv** por completo, você precisa conhecer não só os comandos de instalação, mas também os de manutenção e limpeza. O `uv` é uma "canivete suíço" que substitui o `pip`, `pip-tools`, `pipx`, `poetry`, `pyenv` e até o `virtualenv`.
+# Deep Agents CLI (One-File Runtime)
 
-Aqui está a lista exaustiva dos comandos mais úteis dividida por categoria:
+CLI para orquestrar um pipeline de 3 fases com roles especializados:
 
----
+- planner
+- generator
+- implementer
 
-### 1. Gestão de Fluxo de Trabalho (Project Workflow)
+A implementacao principal fica em `main.py` (one-file). Testes ficam em `tests/`.
 
-Estes são os comandos modernos para quem trabalha com o `pyproject.toml`.
+## Pipeline
 
-* **`uv init`**: Inicializa um novo projeto na pasta atual.
-* **`uv init --lib`**: Inicializa um projeto focado em biblioteca (cria um `src/`).
-* **`uv add [pacote]`**: Adiciona dependência ao projeto.
-* `--dev`: Adiciona como dependência de desenvolvimento.
-* `--editable`: Adiciona o pacote atual em modo editável.
+Fluxo de engenharia (quando acionado):
 
+1. planner
+2. generator
+3. implementer
 
-* **`uv remove [pacote]`**: Remove a dependência e limpa o ambiente.
-* **`uv sync`**: Garante que o `.venv` está **exatamente** igual ao `uv.lock`. Se você deletar a pasta `.venv`, esse comando a recria em milissegundos.
-* **`uv tree`**: Exibe a árvore de dependências do seu projeto (ótimo para achar conflitos).
+Arquivos esperados em `plans/{feature-name}/` (criados pelos roles via tools do deep agent):
 
-### 2. Gestão de Versões do Python
+- `plan.md` (saida do planner)
+- `implementation.md` (saida do generator)
 
-O `uv` baixa binários oficiais do Python (da fonte *indygreg*) automaticamente.
+O implementer le `implementation.md` dessa pasta para executar o plano.
 
-* **`uv python install`**: Instala a versão mais recente do Python.
-* **`uv python install 3.10 3.11 3.12`**: Instala múltiplas versões de uma vez.
-* **`uv python list`**: Mostra todas as versões instaladas no seu PC e as disponíveis para download.
-* **`uv python find`**: Localiza onde está o executável do Python que o uv está usando.
-* **`uv python pin 3.12`**: Trava o projeto atual em uma versão específica do Python.
+## Modos de Execucao
 
-### 3. Execução de Ferramentas e Scripts (O estilo "pipx")
+### 1. Orquestrado (padrao)
 
-Útil para rodar ferramentas sem instalá-las globalmente no sistema.
+Executa planner -> generator -> implementer automaticamente quando o prompt indica tarefa de engenharia.
 
-* **`uvx [ferramenta]`**: Atalho para `uv tool run`. Roda algo como `ruff`, `black` ou `httpie` de forma isolada.
-* **`uv run [script.py]`**: Roda um script Python garantindo que as dependências do projeto estejam presentes.
-* **`uv run --with requests script.py`**: Roda um script único, criando um ambiente temporário com `requests` apenas para essa execução.
-* **`uv tool install [pacote]`**: Instala uma ferramenta globalmente em um ambiente isolado (ex: `uv tool install yt-dlp`).
-* **`uv tool list`**: Lista as ferramentas instaladas via `uv tool`.
+Exemplo de conversa natural:
 
-### 4. Compatibilidade com Pip (Low-level)
+- `oi` -> resposta natural, sem acionar roles.
 
-Para quando você precisa de controle granular ou está em servidores CI/CD.
+Exemplo de tarefa de engenharia:
 
-* **`uv pip install .`**: Instala o pacote do diretório atual.
-* **`uv pip compile requirements.in -o requirements.txt`**: Transforma uma lista de dependências soltas em um arquivo travado (estilo `pip-tools`).
-* **`uv pip sync requirements.txt`**: Faz o ambiente virtual espelhar exatamente o arquivo TXT (remove o que não estiver lá).
-* **`uv pip list`**: Lista o que está instalado no ambiente virtual atual.
+- `implementar feature de auth` -> aciona pipeline.
 
-### 5. Manutenção e Performance
+### 2. Manual por role
 
-O `uv` é rápido porque usa cache e links inteligentes. Às vezes você quer limpar isso.
+Permite chamar um role especifico:
 
-* **`uv cache clean`**: Remove todo o cache de pacotes e downloads de Python.
-* **`uv cache prune`**: Remove apenas entradas de cache antigas ou não utilizadas.
-* **`uv cache dir`**: Mostra onde o `uv` guarda os gigabytes de pacotes.
-* **`uv self update`**: Atualiza o próprio executável do `uv` para a versão mais nova.
+- comando `role`
+- slash command no chat (`/planner`, `/generator`, `/implementer`)
 
----
+## Implementer: HITL e Auto
 
-### Resumo de Ouro
+Sem `--auto`:
 
-| Se você quer... | Use este comando: |
-| --- | --- |
-| **Começar um projeto** | `uv init` |
-| **Instalar um pacote** | `uv add nome-do-pacote` |
-| **Rodar seu código** | `uv run main.py` |
-| **Rodar um CLI (ex: ruff)** | `uvx ruff` |
-| **Trocar a versão do Python** | `uv python install 3.13` |    
-## Tracing (default off)
+- o implementer pausa em checkpoints de STOP & COMMIT
+- pede para o usuario validar, commitar e fazer push manualmente
+- continua somente quando o usuario envia `continue`
 
-By default, tracing is disabled and the process enforces:
+Com `--auto`:
 
-- `LANGSMITH_TRACING=false`
+- remove o modo human-in-the-loop
+- executa 100% continuo ate finalizar
 
-To enable tracing:
+Importante:
+
+- o agente nao executa git automaticamente
+- apenas orienta quando pausar/continuar
+
+## Fluxo de Arquivos (plans)
+
+1. Planner deve criar `plans/{feature-name}/plan.md`.
+2. Generator deve criar `plans/{feature-name}/implementation.md`.
+3. Implementer sempre usa `implementation.md` para implementar.
+
+O nome da pasta deve vir da estrategia do planner/skills e nao de criacao manual no runtime.
+
+## Requisitos
+
+- Python 3.13+
+- uv
+- chave de modelo (OpenRouter/OpenAI, ou provedor configurado)
+
+## Setup Rapido
 
 ```bash
-export ENABLE_LANGSMITH=true
-export LANGSMITH_API_KEY=your_key
-export LANGSMITH_PROJECT=deep-agents-cli
+uv sync
+cp .env.example .env  # se existir no projeto
 ```
 
-Then run:
+Exemplo de variaveis:
 
-```bash
-uv run python main.py doctor
+```env
+OPENROUTER_API_KEY=your_key
+PLANNER__MODEL=stepfun/step-3.5-flash:free
+GENERATOR__MODEL=stepfun/step-3.5-flash:free
+IMPLEMENTER__MODEL=stepfun/step-3.5-flash:free
+PROJECT_ROOT=.
 ```
 
-You should see `"langsmith_enabled": true` and `"langsmith_env": "true"`.
-
-## Commands
+## Comandos (Python)
 
 ```bash
+# Chat interativo (pipeline padrao)
 uv run python main.py chat
+
+# Pipeline em uma execucao
 uv run python main.py chat --prompt "Plan refactor for auth service"
+
+# Pipeline totalmente automatico (sem HITL no implementer)
+uv run python main.py chat --prompt "Plan refactor for auth service" --auto
+
+# Pipeline com log detalhado (verbose)
+uv run python main.py chat --prompt "Plan refactor for auth service" --verbose
+
+# Execucao single-shot
 uv run python main.py run "Implement tests for parser"
+
+# Execucao single-shot em auto
+uv run python main.py run "Implement tests for parser" --auto
+
+# Execucao single-shot em modo verbose
+uv run python main.py run "Implement tests for parser" --verbose
+
+# Manual por role
+uv run python main.py role planner "Criar plano da feature XPTO"
+uv run python main.py role generator "Gerar implementation guide com checkpoints"
+uv run python main.py role implementer "Executar implementation atual"
+uv run python main.py role implementer "Executar implementation atual" --auto
+uv run python main.py role implementer "Executar implementation atual" --verbose
+
+# Slash command no chat (manual por role)
+uv run python main.py chat --prompt "/planner implementar feature xpto"
+uv run python main.py chat --prompt "/generator gerar guia de implementacao"
+uv run python main.py chat --prompt "/implementer executar plano atual"
+
+# Conversa natural (nao aciona roles)
+uv run python main.py chat --prompt "oi"
+
+# Utilitarios
 uv run python main.py doctor
 uv run python main.py models
 uv run python main.py skills
 ```
 
-## Non-interactive usage
+## Tracing (LangSmith)
 
-Use `run` or `chat --prompt` in CI scripts for deterministic single-shot execution.
+Tracing fica desabilitado por padrao.
 
-## 🚀 Executável Standalone
-
-Você também pode usar o executável pré-construído que não requer Python instalado:
+Para habilitar:
 
 ```bash
-# Usar o executável diretamente
-./dist/deep-agents doctor
-./dist/deep-agents chat
-./dist/deep-agents run "Sua tarefa aqui"
+export ENABLE_LANGSMITH=true
+export LANGSMITH_API_KEY=your_key
+export LANGSMITH_PROJECT=deep-agents-cli
+uv run python main.py doctor
 ```
 
-O executável lê variáveis de ambiente ou arquivo `.env` da mesma forma que a versão Python. Veja `EXECUTABLE.md` para instruções completas.
-
-### Configuração Rápida
+## Testes
 
 ```bash
-# Copie o exemplo de .env
-cp .env.example .env
-
-# Edite o arquivo .env com sua API key do OpenRouter
-# Em seguida, execute:
-./dist/deep-agents doctor
+uv run pytest
 ```
 
-Para mais detalhes sobre como usar o executável, consulte [EXECUTABLE.md](EXECUTABLE.md).
+## Executavel Standalone
+
+Uso do binario pre-build esta documentado em `EXECUTABLE.md`.

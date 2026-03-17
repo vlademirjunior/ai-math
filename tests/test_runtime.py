@@ -25,7 +25,7 @@ def test_stream_uses_thread_id(monkeypatch: pytest.MonkeyPatch) -> None:
 
     fake_agent = MagicMock()
     fake_agent.stream.return_value = ["ok"]
-    monkeypatch.setattr(runtime, "create_planner_agent", lambda: fake_agent)
+    monkeypatch.setattr(runtime, "create_chat_agent", lambda: fake_agent)
 
     chunks = list(runtime.stream("hello", "abc-thread"))
     assert chunks == ["ok"]

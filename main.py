@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -21,6 +21,10 @@ from rich.panel import Panel
 console = Console()
 error_console = Console(stderr=True)
 app = typer.Typer(help="Helo", no_args_is_help=True)
+
+IMPLEMENTER_STOP_TOKEN = "STOP_FOR_COMMIT"
+IMPLEMENTER_DONE_TOKEN = "IMPLEMENTATION_COMPLETE"
+STATUS_EVENT_PREFIX = "__STATUS__::"
 
 
 class ModelRole(StrEnum):
@@ -274,19 +278,169 @@ class AgentRuntime:
             settings.project_root, required=settings.skills_required
         )
 
-    def create_planner_agent(self) -> Any:
-        planner_model = self.model_factory.create(self.policy.planner)
-        return create_deep_agent(
-            model=planner_model,
-            backend=self.backend,
-            system_prompt=(
-                "You are a software engineer. Plan before you execute."
-                "Use available tools and be explicit about steps."
-            ),
+    def _builtin_skill_path(self, role: ModelRole) -> Path:
+        skill_name = {
+            ModelRole.PLANNER: "planner_skill.md",
+            ModelRole.GENERATOR: "generator_skill.md",
+            ModelRole.IMPLEMENTER: "implementer_skill.md",
+        }[role]
+        return self.settings.project_root / "skills_builtin" / skill_name
+
+    def _load_builtin_skill_text(self, role: ModelRole) -> str:
+        skill_file = self._builtin_skill_path(role)
+        try:
+            return skill_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _pipeline_contract() -> str:
+        return (
+            "Pipeline contract:\n"
+            "- Always respect the 3 phases in order: planner -> generator -> implementer.\n"
+            "- Preserve context from previous phases and never rewrite intent.\n"
+            "- Keep outputs deterministic, explicit, and directly actionable.\n"
+            "- Use concise status updates and clear completion criteria."
         )
 
-    def stream(self, prompt: str, thread_id: str) -> Iterable[Any]:
-        agent = self.create_planner_agent()
+    def _role_preamble(self, role: ModelRole) -> str:
+        if role is ModelRole.PLANNER:
+            return (
+                "You are the planner role. Your only job is to produce a concrete, testable, and "
+                "ordered implementation plan for this repository. Do not write production code. "
+                "Include validation checkpoints so downstream phases can execute without ambiguity."
+            )
+        if role is ModelRole.GENERATOR:
+            return (
+                "You are the generator role. Convert planner output into a complete implementation "
+                "guide with explicit steps, concrete file-level actions, and verification criteria. "
+                "Avoid ambiguity and preserve the planner scope."
+            )
+        return (
+            "You are the implementer role. Execute the implementation guide step-by-step and "
+            "report what changed and what was validated. Never run git commands; ask the user to "
+            "commit and push manually when checkpoints are reached."
+        )
+
+    def _implementer_control_rules(self, auto: bool) -> str:
+        if auto:
+            return (
+                "AUTO MODE: execute all remaining implementation steps continuously without waiting "
+                "for user intervention. Do not emit manual checkpoint pauses. At final completion, "
+                f"include the exact token {IMPLEMENTER_DONE_TOKEN}."
+            )
+        return (
+            "MANUAL CHECKPOINT MODE: after each STOP & COMMIT checkpoint, stop execution and include "
+            f"the exact token {IMPLEMENTER_STOP_TOKEN} in the response. Then ask the user to review, "
+            "commit, and push manually. Resume only after receiving 'continue'. At final completion, "
+            f"include the exact token {IMPLEMENTER_DONE_TOKEN}."
+        )
+
+    def _system_prompt_for_role(self, role: ModelRole, auto: bool) -> str:
+        parts = [self._pipeline_contract(), self._role_preamble(role)]
+        if role is ModelRole.IMPLEMENTER:
+            parts.append(self._implementer_control_rules(auto))
+
+        skill_text = self._load_builtin_skill_text(role)
+        if skill_text:
+            parts.append("Builtin skill instructions (must be followed):")
+            parts.append(skill_text)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _chunk_to_text(chunk: Any) -> str:
+        if isinstance(chunk, str):
+            return chunk
+        if isinstance(chunk, dict):
+            return AgentRuntime._extract_assistant_text_from_chunk(chunk)
+        return ""
+
+    @staticmethod
+    def _extract_assistant_text_from_chunk(chunk: dict[str, Any]) -> str:
+        texts: list[str] = []
+
+        def extract_messages(container: Any) -> None:
+            if not isinstance(container, list):
+                return
+            for message in container:
+                text = AgentRuntime._assistant_message_to_text(message)
+                if text:
+                    texts.append(text)
+
+        if "messages" in chunk:
+            extract_messages(chunk.get("messages"))
+
+        for key in ("model", "agent", "output"):
+            value = chunk.get(key)
+            if isinstance(value, dict):
+                extract_messages(value.get("messages"))
+
+        return "".join(texts)
+
+    @staticmethod
+    def _assistant_message_to_text(message: Any) -> str:
+        message_type = getattr(message, "type", None)
+        class_name = type(message).__name__.lower()
+        is_assistant = message_type == "ai" or "aimessage" in class_name
+
+        if isinstance(message, dict):
+            role = str(message.get("role", "")).lower()
+            is_assistant = role in {"assistant", "ai"}
+            content = message.get("content")
+            return AgentRuntime._content_to_text(content) if is_assistant else ""
+
+        if not is_assistant:
+            return ""
+
+        return AgentRuntime._content_to_text(getattr(message, "content", None))
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                parts.append(AgentRuntime._content_to_text(item))
+            return "".join(parts)
+        if isinstance(content, dict):
+            text = content.get("text")
+            if isinstance(text, str):
+                return text
+        return ""
+
+    def create_role_agent(self, role: ModelRole, auto: bool = False) -> Any:
+        role_model = self.model_factory.create(role)
+        kwargs: dict[str, Any] = {
+            "model": role_model,
+            "backend": self.backend,
+            "system_prompt": self._system_prompt_for_role(role, auto=auto),
+        }
+        if self.skills:
+            kwargs["skills"] = self.skills
+        return create_deep_agent(**kwargs)
+
+    def create_planner_agent(self) -> Any:
+        return self.create_role_agent(ModelRole.PLANNER)
+
+    def create_chat_agent(self) -> Any:
+        chat_model = self.model_factory.create(self.policy.planner)
+        kwargs: dict[str, Any] = {
+            "model": chat_model,
+            "backend": self.backend,
+            "system_prompt": (
+                "You are a helpful coding assistant. Reply naturally for casual chat. "
+                "For engineering requests, provide practical guidance and concise steps."
+            ),
+        }
+        if self.skills:
+            kwargs["skills"] = self.skills
+        return create_deep_agent(**kwargs)
+
+    def stream_role(
+        self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False
+    ) -> Iterable[Any]:
+        agent = self.create_role_agent(role, auto=auto)
         return cast(
             Iterable[Any],
             agent.stream(
@@ -294,6 +448,286 @@ class AgentRuntime:
                 config={"configurable": {"thread_id": thread_id}},
             ),
         )
+
+    def stream(self, prompt: str, thread_id: str) -> Iterable[Any]:
+        agent = self.create_chat_agent()
+        return cast(
+            Iterable[Any],
+            agent.stream(
+                {"messages": [{"role": "user", "content": prompt}]},
+                config={"configurable": {"thread_id": thread_id}},
+            ),
+        )
+
+    def run_role(
+        self,
+        role: ModelRole,
+        prompt: str,
+        thread_id: str,
+        *,
+        auto: bool = False,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> str:
+        chunks = self.stream_role(role=role, prompt=prompt, thread_id=thread_id, auto=auto)
+        output_parts: list[str] = []
+        for chunk in chunks:
+            text = self._chunk_to_text(chunk)
+            output_parts.append(text)
+            if on_chunk:
+                on_chunk(text)
+        return "".join(output_parts)
+
+    @staticmethod
+    def _contains_token(output: str, token: str) -> bool:
+        return token in output
+
+    @staticmethod
+    def _emit_status(on_chunk: Callable[[str], None] | None, message: str) -> None:
+        if on_chunk is not None:
+            on_chunk(f"{STATUS_EVENT_PREFIX}{message}")
+
+    def run_pipeline(
+        self,
+        prompt: str,
+        thread_id: str,
+        *,
+        auto: bool,
+        request_continue: Callable[[], bool] | None,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> list[Path]:
+        self._emit_status(on_chunk, "\n=== Planner ===")
+        self._emit_status(on_chunk, "Starting planner phase")
+        planner_output = self.run_role(
+            role=ModelRole.PLANNER,
+            prompt=prompt,
+            thread_id=thread_id,
+            auto=auto,
+            on_chunk=on_chunk,
+        )
+        self._emit_status(on_chunk, "Planner phase completed")
+
+        self._emit_status(on_chunk, "\n=== Generator ===")
+        self._emit_status(on_chunk, "Starting generator phase")
+        generator_prompt = (
+            "Use the planner output below to generate a complete implementation plan with explicit "
+            "verification checkpoints. Create/update files under plans/{feature-name} as needed "
+            "according to your role instructions.\n\n"
+            f"User request:\n{prompt}\n\nPlanner output:\n{planner_output}"
+        )
+        generator_output = self.run_role(
+            role=ModelRole.GENERATOR,
+            prompt=generator_prompt,
+            thread_id=thread_id,
+            auto=auto,
+            on_chunk=on_chunk,
+        )
+        self._emit_status(on_chunk, "Generator phase completed")
+
+        self._emit_status(on_chunk, "\n=== Implementer ===")
+        self._emit_status(on_chunk, "Starting implementer phase")
+        implementer_prompt = (
+            "Execute the implementation plan below in order. Respect STOP & COMMIT checkpoints and "
+            "report progress clearly. Read implementation.md created by previous phases and execute "
+            "accordingly.\n\n"
+            f"Implementation guide:\n{generator_output}"
+        )
+        step = 1
+        while True:
+            self._emit_status(on_chunk, f"Implementer step {step} running")
+            implementer_output = self.run_role(
+                role=ModelRole.IMPLEMENTER,
+                prompt=implementer_prompt,
+                thread_id=thread_id,
+                auto=auto,
+                on_chunk=on_chunk,
+            )
+
+            if auto or self._contains_token(implementer_output, IMPLEMENTER_DONE_TOKEN):
+                self._emit_status(on_chunk, "Implementer phase completed")
+                break
+
+            if not self._contains_token(implementer_output, IMPLEMENTER_STOP_TOKEN):
+                self._emit_status(on_chunk, "Implementer finished without STOP token")
+                break
+
+            if request_continue is None:
+                self._emit_status(on_chunk, "Implementer paused: no continue handler")
+                break
+
+            if not request_continue():
+                self._emit_status(on_chunk, "Implementer paused by user")
+                break
+
+            implementer_prompt = "continue"
+            step += 1
+
+        return []
+
+    def run_manual_role(
+        self,
+        role: ModelRole,
+        prompt: str,
+        thread_id: str,
+        *,
+        auto: bool,
+        request_continue: Callable[[], bool] | None,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> list[Path]:
+        if role is not ModelRole.IMPLEMENTER:
+            self._emit_status(on_chunk, f"\n=== {role.value.capitalize()} ===")
+            self._emit_status(on_chunk, f"Starting {role.value} phase")
+            role_prompt = prompt
+            if role is ModelRole.GENERATOR:
+                role_prompt = (
+                    "Use the existing plan.md generated by planner to produce implementation.md in the "
+                    "same plans/{feature-name} folder.\n\n"
+                    f"User request:\n{prompt}"
+                )
+            self.run_role(
+                role=role,
+                prompt=role_prompt,
+                thread_id=thread_id,
+                auto=auto,
+                on_chunk=on_chunk,
+            )
+            self._emit_status(on_chunk, f"{role.value.capitalize()} phase completed")
+            return []
+
+        outputs: list[Path] = []
+        self._emit_status(on_chunk, "\n=== Implementer ===")
+        self._emit_status(on_chunk, "Starting implementer phase")
+        current_prompt = (
+            "Read implementation.md generated by generator under plans/{feature-name} and execute it "
+            "in order.\n\n"
+            f"User request:\n{prompt}"
+        )
+        step = 1
+        while True:
+            self._emit_status(on_chunk, f"Implementer step {step} running")
+            output = self.run_role(
+                role=ModelRole.IMPLEMENTER,
+                prompt=current_prompt,
+                thread_id=thread_id,
+                auto=auto,
+                on_chunk=on_chunk,
+            )
+
+            if auto:
+                self._emit_status(on_chunk, "Implementer phase completed")
+                break
+            if self._contains_token(output, IMPLEMENTER_DONE_TOKEN):
+                self._emit_status(on_chunk, "Implementer phase completed")
+                break
+            if not self._contains_token(output, IMPLEMENTER_STOP_TOKEN):
+                self._emit_status(on_chunk, "Implementer finished without STOP token")
+                break
+            if request_continue is None or not request_continue():
+                self._emit_status(on_chunk, "Implementer paused by user")
+                break
+
+            current_prompt = "continue"
+            step += 1
+
+        return outputs
+
+    def run_chat(
+        self, prompt: str, thread_id: str, on_chunk: Callable[[str], None] | None = None
+    ) -> str:
+        chunks = self.stream(prompt=prompt, thread_id=thread_id)
+        parts: list[str] = []
+        for chunk in chunks:
+            text = self._chunk_to_text(chunk)
+            parts.append(text)
+            if on_chunk:
+                on_chunk(text)
+        return "".join(parts)
+
+
+def should_trigger_pipeline(prompt: str) -> bool:
+    normalized = prompt.strip().lower()
+    if not normalized:
+        return False
+
+    greetings = {
+        "oi",
+        "ola",
+        "olá",
+        "hello",
+        "hi",
+        "hey",
+        "bom dia",
+        "boa tarde",
+        "boa noite",
+    }
+    if normalized in greetings:
+        return False
+
+    if len(normalized.split()) <= 3 and any(normalized.startswith(g) for g in greetings):
+        return False
+
+    keywords = (
+        "feature",
+        "implement",
+        "implementar",
+        "refactor",
+        "bug",
+        "fix",
+        "teste",
+        "test",
+        "code",
+        "codigo",
+        "código",
+        "plano",
+        "plan",
+        "pipeline",
+    )
+    return any(word in normalized for word in keywords)
+
+
+def parse_manual_role_command(message: str) -> tuple[ModelRole, str] | None:
+    stripped = message.strip()
+    if not stripped.startswith("/"):
+        return None
+    tokens = stripped.split(maxsplit=1)
+    role_token = tokens[0][1:].strip().lower()
+    prompt = tokens[1].strip() if len(tokens) > 1 else ""
+    if not prompt:
+        return None
+
+    try:
+        role = ModelRole(role_token)
+    except ValueError:
+        return None
+    return role, prompt
+
+
+def ask_continue_after_checkpoint() -> bool:
+    while True:
+        answer = (
+            console.input(
+                "[bold yellow]Implementer paused. Commit and push your changes, "
+                "then type 'continue' to proceed (or 'stop' to finish): [/]"
+            )
+            .strip()
+            .lower()
+        )
+        if answer == "continue":
+            return True
+        if answer in {"stop", "exit", "quit"}:
+            return False
+        console.print("Type 'continue' or 'stop'.")
+
+
+def build_output_handler(verbose: bool) -> Callable[[str], None]:
+    def handler(text: str) -> None:
+        if text.startswith(STATUS_EVENT_PREFIX):
+            message = text[len(STATUS_EVENT_PREFIX) :]
+            console.print(f"[bold cyan]{message}[/]")
+            return
+        if verbose and text:
+            console.print(text, end="")
+
+    return handler
 
 
 @contextmanager
@@ -324,14 +758,48 @@ def tracing_enabled_context(enabled: bool, project: str | None):  # type: ignore
 def chat(
     prompt: str | None = typer.Option(default=None, help="Prompt to run once."),
     thread_id: str = typer.Option(default="deep-agents-session", help="Thread identifier."),
+    auto: bool = typer.Option(
+        default=False,
+        help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
+    ),
+    verbose: bool = typer.Option(
+        default=False,
+        help="When enabled, prints intermediate streaming logs from model/tool execution.",
+    ),
 ) -> None:
     settings = get_settings()
     runtime = AgentRuntime(settings)
 
     with tracing_enabled_context(settings.enable_langsmith, settings.langsmith_project):
+        on_chunk = build_output_handler(verbose)
         if prompt:
-            for chunk in runtime.stream(prompt=prompt, thread_id=thread_id):
-                console.print(chunk, end="")
+            manual_role = parse_manual_role_command(prompt)
+            if manual_role:
+                role, role_prompt = manual_role
+                runtime.run_manual_role(
+                    role=role,
+                    prompt=role_prompt,
+                    thread_id=thread_id,
+                    auto=auto,
+                    request_continue=ask_continue_after_checkpoint if not auto else None,
+                    on_chunk=on_chunk,
+                )
+            elif should_trigger_pipeline(prompt):
+                runtime.run_pipeline(
+                    prompt=prompt,
+                    thread_id=thread_id,
+                    auto=auto,
+                    request_continue=ask_continue_after_checkpoint if not auto else None,
+                    on_chunk=on_chunk,
+                )
+            else:
+                output = runtime.run_chat(
+                    prompt=prompt,
+                    thread_id=thread_id,
+                    on_chunk=on_chunk,
+                )
+                if not verbose and output.strip():
+                    console.print(output)
             console.print()
             return
 
@@ -342,8 +810,34 @@ def chat(
                 return
             if not message:
                 continue
-            for chunk in runtime.stream(prompt=message, thread_id=thread_id):
-                console.print(chunk, end="")
+
+            manual_role = parse_manual_role_command(message)
+            if manual_role:
+                role, role_prompt = manual_role
+                runtime.run_manual_role(
+                    role=role,
+                    prompt=role_prompt,
+                    thread_id=thread_id,
+                    auto=auto,
+                    request_continue=ask_continue_after_checkpoint if not auto else None,
+                    on_chunk=on_chunk,
+                )
+            elif should_trigger_pipeline(message):
+                runtime.run_pipeline(
+                    prompt=message,
+                    thread_id=thread_id,
+                    auto=auto,
+                    request_continue=ask_continue_after_checkpoint if not auto else None,
+                    on_chunk=on_chunk,
+                )
+            else:
+                output = runtime.run_chat(
+                    prompt=message,
+                    thread_id=thread_id,
+                    on_chunk=on_chunk,
+                )
+                if not verbose and output.strip():
+                    console.print(output)
             console.print()
 
 
@@ -351,12 +845,79 @@ def chat(
 def run(
     prompt: str = typer.Argument(..., help="Single prompt execution."),
     thread_id: str = typer.Option(default="deep-agents-session", help="Thread identifier."),
+    auto: bool = typer.Option(
+        default=False,
+        help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
+    ),
+    verbose: bool = typer.Option(
+        default=False,
+        help="When enabled, prints intermediate streaming logs from model/tool execution.",
+    ),
 ) -> None:
     settings = get_settings()
     runtime = AgentRuntime(settings)
     with tracing_enabled_context(settings.enable_langsmith, settings.langsmith_project):
-        for chunk in runtime.stream(prompt=prompt, thread_id=thread_id):
-            console.print(chunk, end="")
+        on_chunk = build_output_handler(verbose)
+        manual_role = parse_manual_role_command(prompt)
+        if manual_role:
+            role, role_prompt = manual_role
+            runtime.run_manual_role(
+                role=role,
+                prompt=role_prompt,
+                thread_id=thread_id,
+                auto=auto,
+                request_continue=ask_continue_after_checkpoint if not auto else None,
+                on_chunk=on_chunk,
+            )
+        elif should_trigger_pipeline(prompt):
+            runtime.run_pipeline(
+                prompt=prompt,
+                thread_id=thread_id,
+                auto=auto,
+                request_continue=ask_continue_after_checkpoint if not auto else None,
+                on_chunk=on_chunk,
+            )
+        else:
+            output = runtime.run_chat(
+                prompt=prompt,
+                thread_id=thread_id,
+                on_chunk=on_chunk,
+            )
+            if not verbose and output.strip():
+                console.print(output)
+        console.print()
+
+
+@app.command("role")
+def role_command(
+    role: ModelRole = typer.Argument(
+        ..., help="Role to execute manually: planner|generator|implementer"
+    ),
+    prompt: str = typer.Argument(..., help="Role prompt."),
+    thread_id: str = typer.Option(default="deep-agents-session", help="Thread identifier."),
+    auto: bool = typer.Option(
+        default=False,
+        help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
+    ),
+    verbose: bool = typer.Option(
+        default=False,
+        help="When enabled, prints intermediate streaming logs from model/tool execution.",
+    ),
+) -> None:
+    settings = get_settings()
+    runtime = AgentRuntime(settings)
+    with tracing_enabled_context(settings.enable_langsmith, settings.langsmith_project):
+        on_chunk = build_output_handler(verbose)
+        runtime.run_manual_role(
+            role=role,
+            prompt=prompt,
+            thread_id=thread_id,
+            auto=auto,
+            request_continue=ask_continue_after_checkpoint
+            if (role is ModelRole.IMPLEMENTER and not auto)
+            else None,
+            on_chunk=on_chunk,
+        )
         console.print()
 
 
