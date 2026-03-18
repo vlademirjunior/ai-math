@@ -104,6 +104,14 @@ def test_run_pipeline_emits_phase_status_events(monkeypatch, tmp_path: Path) -> 
     runtime = AgentRuntime(_settings(tmp_path))
 
     def fake_stream_role(self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False):
+        plans_dir = tmp_path / "plans" / "feature-x"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        if role is ModelRole.PLANNER:
+            (plans_dir / "plan.md").write_text("# Plan", encoding="utf-8")
+            return ["**File:** `plans/feature-x/plan.md`\n# Plan"]
+        if role is ModelRole.GENERATOR:
+            (plans_dir / "implementation.md").write_text("# Implementation", encoding="utf-8")
+            return ["**File:** `plans/feature-x/implementation.md`\n# Implementation"]
         if role is ModelRole.IMPLEMENTER:
             return [f"done {IMPLEMENTER_DONE_TOKEN}"]
         return ["ok"]

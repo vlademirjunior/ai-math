@@ -70,6 +70,43 @@ def test_chat_prompt_auto_calls_pipeline(monkeypatch: pytest.MonkeyPatch) -> Non
     assert calls == [("Pipeline this", True)]
 
 
+def test_chat_engineering_prompt_routes_to_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline_calls: list[str] = []
+    chat_calls: list[str] = []
+
+    class StubRuntime:
+        def __init__(self, settings: AppSettings, *args, **kwargs) -> None:
+            self.settings = settings
+
+        def run_pipeline(
+            self, prompt: str, thread_id: str, *, auto: bool, request_continue, on_chunk
+        ) -> list:
+            pipeline_calls.append(prompt)
+            return []
+
+        def run_chat(self, prompt: str, thread_id: str, on_chunk) -> str:
+            chat_calls.append(prompt)
+            return ""
+
+    monkeypatch.setattr(main, "get_settings", _litellm_settings)
+    monkeypatch.setattr(main, "AgentRuntime", StubRuntime)
+
+    result = runner.invoke(
+        app,
+        [
+            "chat",
+            "--prompt",
+            (
+                "Crie uma API simples com FastAPI, Pydantic e SQLAlchemy, com Dockerfile e "
+                "docker-compose"
+            ),
+        ],
+    )
+    assert result.exit_code == 0
+    assert len(pipeline_calls) == 1
+    assert chat_calls == []
+
+
 def test_role_command_routes_manual_role(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, bool]] = []
 

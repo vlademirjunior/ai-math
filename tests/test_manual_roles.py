@@ -31,7 +31,10 @@ def test_manual_role_runs_single_shot_for_non_implementer(monkeypatch, tmp_path:
     runtime = AgentRuntime(_settings(tmp_path))
 
     def fake_stream_role(self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False):
-        return ["ok"]
+        plans_dir = tmp_path / "plans" / "generate-docs"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        (plans_dir / "plan.md").write_text("# Plan", encoding="utf-8")
+        return ["**File:** `plans/generate-docs/plan.md`\n# Plan"]
 
     monkeypatch.setattr(AgentRuntime, "stream_role", fake_stream_role)
 
@@ -55,3 +58,11 @@ def test_should_trigger_pipeline_for_greeting_is_false() -> None:
 
 def test_should_trigger_pipeline_for_engineering_request_is_true() -> None:
     assert should_trigger_pipeline("implementar feature de auth") is True
+
+
+def test_should_trigger_pipeline_for_long_api_build_prompt_is_true() -> None:
+    prompt = (
+        "Voce e um Engenheiro de Software Senior. Crie uma API simples com FastAPI, "
+        "Pydantic, SQLAlchemy, Dockerfile e docker-compose."
+    )
+    assert should_trigger_pipeline(prompt) is True

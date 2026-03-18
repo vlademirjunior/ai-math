@@ -175,6 +175,7 @@ Erros de conexao MCP nao interrompem execucao. O runtime faz fallback automatico
 ```bash
 uv sync
 cp .env.example .env  # se existir no projeto
+source .venv/bin/activate
 ```
 
 Exemplo de variaveis:

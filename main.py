@@ -1490,6 +1490,10 @@ class AgentRuntime:
 
         skill_text = self._load_builtin_skill_text(role)
         if skill_text:
+            parts.append(
+                "CRITICAL: Builtin skill instructions below are mandatory and must be followed "
+                "strictly."
+            )
             parts.append("Builtin skill instructions (must be followed):")
             parts.append(skill_text)
         return "\n\n".join(parts)
@@ -1672,56 +1676,87 @@ class AgentRuntime:
             slug = slug[:max_len].rstrip("-")
         return slug or "feature"
 
-    def _extract_path_from_output(self, output: str) -> Path | None:
-        """Try to locate a file path in the agent's output.
+    def _extract_paths_from_output(self, output: str) -> list[Path]:
+        """Extract candidate artifact paths mentioned by role output.
 
-        Looks for lines like:
-        - **File:** `plans/foo/plan.md`
-        - File: plans/foo/implementation.md
+        We intentionally do not write files from app code. Roles/deep agent must
+        create files through their own tool execution. This parser only helps us
+        discover artifacts that were already created.
         """
 
         import re
 
+        candidates: list[str] = []
         for line in output.splitlines():
             m = re.search(r"(?:\*\*File:\*\*|File:)\s*`?([^`\s]+)`?", line, re.IGNORECASE)
             if m:
-                return Path(m.group(1))
+                candidates.append(m.group(1))
 
-        # Fallback: find first plans/ path
-        m = re.search(r"(plans/[A-Za-z0-9_\-/.]+\.md)", output)
-        if m:
-            return Path(m.group(1))
-        return None
+        candidates.extend(re.findall(r"(plans/[A-Za-z0-9_\-/.]+\.md)", output))
 
-    def _persist_agent_output(
-        self, output: str, project_root: Path, default_path: Path | None = None
-    ) -> Path | None:
-        """Save agent output to a file when a path can be inferred or a default is provided."""
+        deduped: list[Path] = []
+        seen: set[Path] = set()
+        for candidate in candidates:
+            path = Path(candidate)
+            if path in seen:
+                continue
+            seen.add(path)
+            deduped.append(path)
+        return deduped
 
-        target = self._extract_path_from_output(output)
-        if target is None:
-            target = default_path
-        if target is None:
-            return None
+    def _collect_existing_output_artifacts(self, output: str, project_root: Path) -> list[Path]:
+        """Return only artifact files that already exist and are inside the project."""
 
-        if not target.is_absolute():
-            target = project_root / target
+        project_root_resolved = project_root.resolve()
+        existing: list[Path] = []
+        seen: set[Path] = set()
+        for candidate in self._extract_paths_from_output(output):
+            target = candidate if candidate.is_absolute() else (project_root_resolved / candidate)
+            try:
+                resolved = target.resolve()
+            except Exception:
+                continue
+            if project_root_resolved not in resolved.parents and resolved != project_root_resolved:
+                continue
+            if not resolved.exists() or not resolved.is_file() or resolved in seen:
+                continue
+            seen.add(resolved)
+            existing.append(resolved)
+        return existing
 
-        try:
-            target = target.resolve()
-        except Exception:
-            return None
+    def _snapshot_plan_artifacts(self, project_root: Path) -> dict[Path, tuple[int, int]]:
+        """Capture plans/**/*.md file metadata for change detection across phases."""
 
-        try:
-            project_root_resolved = project_root.resolve()
-            if project_root_resolved not in target.parents and target != project_root_resolved:
-                return None
-        except Exception:
-            return None
+        root = project_root.resolve()
+        plans_dir = root / "plans"
+        if not plans_dir.exists() or not plans_dir.is_dir():
+            return {}
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(output, encoding="utf-8")
-        return target
+        snapshot: dict[Path, tuple[int, int]] = {}
+        for path in plans_dir.rglob("*.md"):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            snapshot[path.resolve()] = (stat.st_mtime_ns, stat.st_size)
+        return snapshot
+
+    def _collect_changed_plan_artifacts(
+        self,
+        before: dict[Path, tuple[int, int]],
+        after: dict[Path, tuple[int, int]],
+    ) -> list[Path]:
+        """Return plan artifacts created/updated between two snapshots."""
+
+        changed: list[Path] = []
+        for path in sorted(after):
+            prev = before.get(path)
+            curr = after[path]
+            if prev is None or prev != curr:
+                changed.append(path)
+        return changed
 
     def create_role_agent(self, role: ModelRole, auto: bool = False) -> Any:
         cache_key = (role, auto)
@@ -1754,7 +1789,8 @@ class AgentRuntime:
             "backend": self.backend,
             "system_prompt": (
                 "You are a helpful coding assistant. Reply naturally for casual chat. "
-                "For engineering requests, provide practical guidance and concise steps."
+                "Never create, edit, or delete files and never run shell commands in chat mode. "
+                "For engineering/build tasks, instruct the user to use the pipeline/role commands."
             ),
         }
         if self.skills:
@@ -1819,19 +1855,20 @@ class AgentRuntime:
         thread_id: str,
         *,
         auto: bool,
-        request_continue: Callable[[], bool] | None,
+        request_continue: Callable[[str], bool] | None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> list[Path]:
         outputs: list[Path] = []
 
-        feature_slug = self._slugify(prompt)
-        default_plan_path = self.settings.project_root / "plans" / feature_slug / "plan.md"
-        default_impl_path = (
-            self.settings.project_root / "plans" / feature_slug / "implementation.md"
-        )
+        def _find_artifact(name: str) -> Path | None:
+            for item in outputs:
+                if item.name == name:
+                    return item
+            return None
 
         self._emit_status(on_chunk, "\n=== Planner ===")
         self._emit_status(on_chunk, "Starting planner phase")
+        before_planner = self._snapshot_plan_artifacts(self.settings.project_root)
         planner_output = self.run_role(
             role=ModelRole.PLANNER,
             prompt=prompt,
@@ -1841,11 +1878,17 @@ class AgentRuntime:
         )
         self._emit_status(on_chunk, "Planner phase completed")
 
-        plan_file = self._persist_agent_output(
-            planner_output, self.settings.project_root, default_plan_path
-        )
-        if plan_file is not None:
-            outputs.append(plan_file)
+        after_planner = self._snapshot_plan_artifacts(self.settings.project_root)
+        outputs.extend(self._collect_changed_plan_artifacts(before_planner, after_planner))
+
+        plan_file = _find_artifact("plan.md")
+        if plan_file is None:
+            self._emit_status(
+                on_chunk,
+                "Planner did not create plans/{feature-name}/plan.md. "
+                "Stopping pipeline before generator.",
+            )
+            return outputs
 
         # In non-auto mode, pause after planner so user can review plan.md
         if not auto:
@@ -1857,17 +1900,21 @@ class AgentRuntime:
                 on_chunk,
                 "Type 'continue' to proceed or 'stop' to exit.",
             )
-            if request_continue is None or not request_continue():
+            if request_continue is None or not request_continue("planner"):
                 return outputs
 
         self._emit_status(on_chunk, "\n=== Generator ===")
         self._emit_status(on_chunk, "Starting generator phase")
         generator_prompt = (
-            "Use the planner output below to generate a complete implementation plan with explicit "
-            "verification checkpoints. Create/update files under plans/{feature-name} as needed "
-            "according to your role instructions.\n\n"
-            f"User request:\n{prompt}\n\nPlanner output:\n{planner_output}"
+            "Generate a complete implementation guide with explicit verification checkpoints. "
+            "First, locate and read plans/{feature-name}/plan.md created by planner "
+            "using tools. "
+            "If the file is unavailable, use the planner output fallback below. "
+            "Create/update files under plans/{feature-name} according to "
+            "your role instructions.\n\n"
+            f"User request:\n{prompt}\n\nPlanner output (fallback):\n{planner_output}"
         )
+        before_generator = self._snapshot_plan_artifacts(self.settings.project_root)
         generator_output = self.run_role(
             role=ModelRole.GENERATOR,
             prompt=generator_prompt,
@@ -1877,11 +1924,17 @@ class AgentRuntime:
         )
         self._emit_status(on_chunk, "Generator phase completed")
 
-        impl_file = self._persist_agent_output(
-            generator_output, self.settings.project_root, default_impl_path
-        )
-        if impl_file is not None:
-            outputs.append(impl_file)
+        after_generator = self._snapshot_plan_artifacts(self.settings.project_root)
+        outputs.extend(self._collect_changed_plan_artifacts(before_generator, after_generator))
+
+        impl_file = _find_artifact("implementation.md")
+        if impl_file is None:
+            self._emit_status(
+                on_chunk,
+                "Generator did not create plans/{feature-name}/implementation.md. "
+                "Stopping pipeline before implementer.",
+            )
+            return outputs
 
         # In non-auto mode, pause after generator so user can review implementation.md
         if not auto:
@@ -1893,7 +1946,7 @@ class AgentRuntime:
                 on_chunk,
                 "Type 'continue' to proceed or 'stop' to exit.",
             )
-            if request_continue is None or not request_continue():
+            if request_continue is None or not request_continue("generator"):
                 return outputs
 
         self._emit_status(on_chunk, "\n=== Implementer ===")
@@ -1901,13 +1954,8 @@ class AgentRuntime:
 
         implementation_text = generator_output
         try:
-            if default_impl_path.exists():
-                try:
-                    implementation_text = default_impl_path.read_text(encoding="utf-8")
-                except OSError:
-                    pass
+            implementation_text = impl_file.read_text(encoding="utf-8")
         except OSError:
-            # Path may be invalid or too long. Continue using generator output.
             pass
 
         implementer_prompt = (
@@ -1940,7 +1988,7 @@ class AgentRuntime:
                 self._emit_status(on_chunk, "Implementer paused: no continue handler")
                 break
 
-            if not request_continue():
+            if not request_continue("implementer"):
                 self._emit_status(on_chunk, "Implementer paused by user")
                 break
 
@@ -1960,11 +2008,6 @@ class AgentRuntime:
         on_chunk: Callable[[str], None] | None = None,
     ) -> list[Path]:
         outputs: list[Path] = []
-        feature_slug = self._slugify(prompt)
-        default_plan_path = self.settings.project_root / "plans" / feature_slug / "plan.md"
-        default_impl_path = (
-            self.settings.project_root / "plans" / feature_slug / "implementation.md"
-        )
 
         if role is not ModelRole.IMPLEMENTER:
             self._emit_status(on_chunk, f"\n=== {role.value.capitalize()} ===")
@@ -1977,6 +2020,7 @@ class AgentRuntime:
                     "same plans/{feature-name} folder.\n\n"
                     f"User request:\n{prompt}"
                 )
+            before = self._snapshot_plan_artifacts(self.settings.project_root)
             output = self.run_role(
                 role=role,
                 prompt=role_prompt,
@@ -1986,18 +2030,12 @@ class AgentRuntime:
             )
             self._emit_status(on_chunk, f"{role.value.capitalize()} phase completed")
 
-            if role is ModelRole.PLANNER:
-                plan_file = self._persist_agent_output(
-                    output, self.settings.project_root, default_plan_path
+            after = self._snapshot_plan_artifacts(self.settings.project_root)
+            outputs.extend(self._collect_changed_plan_artifacts(before, after))
+            if not outputs:
+                outputs.extend(
+                    self._collect_existing_output_artifacts(output, self.settings.project_root)
                 )
-                if plan_file is not None:
-                    outputs.append(plan_file)
-            elif role is ModelRole.GENERATOR:
-                impl_file = self._persist_agent_output(
-                    output, self.settings.project_root, default_impl_path
-                )
-                if impl_file is not None:
-                    outputs.append(impl_file)
 
             return outputs
 
@@ -2079,6 +2117,28 @@ def should_trigger_pipeline(prompt: str) -> bool:
         "feature",
         "implement",
         "implementar",
+        "criar",
+        "gera",
+        "gerar",
+        "construir",
+        "build",
+        "api",
+        "fastapi",
+        "endpoint",
+        "serviço",
+        "servico",
+        "microserviço",
+        "microservico",
+        "docker",
+        "dockerfile",
+        "docker-compose",
+        "postgres",
+        "redis",
+        "sqlalchemy",
+        "pydantic",
+        "estrutura",
+        "pasta",
+        "projeto",
         "refactor",
         "bug",
         "fix",
@@ -2111,16 +2171,25 @@ def parse_manual_role_command(message: str) -> tuple[ModelRole, str] | None:
     return role, prompt
 
 
-def ask_continue_after_checkpoint() -> bool:
-    while True:
-        answer = (
-            console.input(
-                "[bold yellow]Implementer paused. Commit and push your changes, "
-                "then type 'continue' to proceed (or 'stop' to finish): [/]"
-            )
-            .strip()
-            .lower()
+def ask_continue_after_checkpoint(phase: str = "implementer") -> bool:
+    if phase == "planner":
+        prompt_text = (
+            "[bold yellow]Planner paused. Review plans/{feature-name}/plan.md, "
+            "then type 'continue' to proceed (or 'stop' to finish): [/]"
         )
+    elif phase == "generator":
+        prompt_text = (
+            "[bold yellow]Generator paused. Review plans/{feature-name}/implementation.md, "
+            "then type 'continue' to proceed (or 'stop' to finish): [/]"
+        )
+    else:
+        prompt_text = (
+            "[bold yellow]Implementer paused. Commit and push your changes, "
+            "then type 'continue' to proceed (or 'stop' to finish): [/]"
+        )
+
+    while True:
+        answer = console.input(prompt_text).strip().lower()
         if answer == "continue":
             return True
         if answer in {"stop", "exit", "quit"}:
