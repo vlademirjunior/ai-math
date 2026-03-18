@@ -1655,6 +1655,70 @@ class AgentRuntime:
             return f"{rendered[:MAX_VERBOSE_DUMP_CHARS]} ...(truncated)"
         return rendered
 
+    @staticmethod
+    def _slugify(text: str) -> str:
+        """Create a filesystem-safe slug from a string."""
+        import re
+
+        if not text:
+            return "feature"
+        slug = text.lower().strip()
+        slug = slug.splitlines()[0]
+        slug = re.sub(r"[^a-z0-9]+", "-", slug)
+        slug = slug.strip("-")
+        return slug or "feature"
+
+    def _extract_path_from_output(self, output: str) -> Path | None:
+        """Try to locate a file path in the agent's output.
+
+        Looks for lines like:
+        - **File:** `plans/foo/plan.md`
+        - File: plans/foo/implementation.md
+        """
+
+        import re
+
+        for line in output.splitlines():
+            m = re.search(r"(?:\*\*File:\*\*|File:)\s*`?([^`\s]+)`?", line, re.IGNORECASE)
+            if m:
+                return Path(m.group(1))
+
+        # Fallback: find first plans/ path
+        m = re.search(r"(plans/[A-Za-z0-9_\-/.]+\.md)", output)
+        if m:
+            return Path(m.group(1))
+        return None
+
+    def _persist_agent_output(
+        self, output: str, project_root: Path, default_path: Path | None = None
+    ) -> Path | None:
+        """Save agent output to a file when a path can be inferred or a default is provided."""
+
+        target = self._extract_path_from_output(output)
+        if target is None:
+            target = default_path
+        if target is None:
+            return None
+
+        if not target.is_absolute():
+            target = project_root / target
+
+        try:
+            target = target.resolve()
+        except Exception:
+            return None
+
+        try:
+            project_root_resolved = project_root.resolve()
+            if project_root_resolved not in target.parents and target != project_root_resolved:
+                return None
+        except Exception:
+            return None
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(output, encoding="utf-8")
+        return target
+
     def create_role_agent(self, role: ModelRole, auto: bool = False) -> Any:
         cache_key = (role, auto)
         cached = self._role_agents.get(cache_key)
@@ -1754,6 +1818,14 @@ class AgentRuntime:
         request_continue: Callable[[], bool] | None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> list[Path]:
+        outputs: list[Path] = []
+
+        feature_slug = self._slugify(prompt)
+        default_plan_path = self.settings.project_root / "plans" / feature_slug / "plan.md"
+        default_impl_path = (
+            self.settings.project_root / "plans" / feature_slug / "implementation.md"
+        )
+
         self._emit_status(on_chunk, "\n=== Planner ===")
         self._emit_status(on_chunk, "Starting planner phase")
         planner_output = self.run_role(
@@ -1764,6 +1836,12 @@ class AgentRuntime:
             on_chunk=on_chunk,
         )
         self._emit_status(on_chunk, "Planner phase completed")
+
+        plan_file = self._persist_agent_output(
+            planner_output, self.settings.project_root, default_plan_path
+        )
+        if plan_file is not None:
+            outputs.append(plan_file)
 
         self._emit_status(on_chunk, "\n=== Generator ===")
         self._emit_status(on_chunk, "Starting generator phase")
@@ -1782,14 +1860,28 @@ class AgentRuntime:
         )
         self._emit_status(on_chunk, "Generator phase completed")
 
+        impl_file = self._persist_agent_output(
+            generator_output, self.settings.project_root, default_impl_path
+        )
+        if impl_file is not None:
+            outputs.append(impl_file)
+
         self._emit_status(on_chunk, "\n=== Implementer ===")
         self._emit_status(on_chunk, "Starting implementer phase")
+
+        implementation_text = generator_output
+        if default_impl_path.exists():
+            try:
+                implementation_text = default_impl_path.read_text(encoding="utf-8")
+            except OSError:
+                pass
+
         implementer_prompt = (
             "Execute the implementation plan below in order. Respect STOP & COMMIT checkpoints and "
             "report progress clearly. Read implementation.md created by previous phases "
             "and execute "
             "accordingly.\n\n"
-            f"Implementation guide:\n{generator_output}"
+            f"Implementation guide:\n{implementation_text}"
         )
         step = 1
         while True:
@@ -1821,7 +1913,7 @@ class AgentRuntime:
             implementer_prompt = "continue"
             step += 1
 
-        return []
+        return outputs
 
     def run_manual_role(
         self,
@@ -1833,6 +1925,13 @@ class AgentRuntime:
         request_continue: Callable[[], bool] | None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> list[Path]:
+        outputs: list[Path] = []
+        feature_slug = self._slugify(prompt)
+        default_plan_path = self.settings.project_root / "plans" / feature_slug / "plan.md"
+        default_impl_path = (
+            self.settings.project_root / "plans" / feature_slug / "implementation.md"
+        )
+
         if role is not ModelRole.IMPLEMENTER:
             self._emit_status(on_chunk, f"\n=== {role.value.capitalize()} ===")
             self._emit_status(on_chunk, f"Starting {role.value} phase")
@@ -1844,7 +1943,7 @@ class AgentRuntime:
                     "same plans/{feature-name} folder.\n\n"
                     f"User request:\n{prompt}"
                 )
-            self.run_role(
+            output = self.run_role(
                 role=role,
                 prompt=role_prompt,
                 thread_id=thread_id,
@@ -1852,7 +1951,21 @@ class AgentRuntime:
                 on_chunk=on_chunk,
             )
             self._emit_status(on_chunk, f"{role.value.capitalize()} phase completed")
-            return []
+
+            if role is ModelRole.PLANNER:
+                plan_file = self._persist_agent_output(
+                    output, self.settings.project_root, default_plan_path
+                )
+                if plan_file is not None:
+                    outputs.append(plan_file)
+            elif role is ModelRole.GENERATOR:
+                impl_file = self._persist_agent_output(
+                    output, self.settings.project_root, default_impl_path
+                )
+                if impl_file is not None:
+                    outputs.append(impl_file)
+
+            return outputs
 
         outputs: list[Path] = []
         self._emit_status(on_chunk, "\n=== Implementer ===")

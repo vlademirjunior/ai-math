@@ -44,7 +44,9 @@ def test_manual_role_runs_single_shot_for_non_implementer(monkeypatch, tmp_path:
         on_chunk=None,
     )
 
-    assert artifacts == []
+    plan_path = tmp_path / "plans" / "generate-docs" / "plan.md"
+    assert plan_path.exists()
+    assert plan_path in artifacts
 
 
 def test_should_trigger_pipeline_for_greeting_is_false() -> None:
