@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 from pathlib import Path
 
 # Ensure the repository root is on sys.path so tests can import main.py

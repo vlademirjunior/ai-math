@@ -80,7 +80,7 @@ def test_chat_reset_starts_new_session(monkeypatch, tmp_path: Path) -> None:
     printed: list[str] = []
 
     class StubRuntime:
-        def __init__(self, settings: AppSettings) -> None:
+        def __init__(self, settings: AppSettings, *args: Any, **kwargs: Any) -> None:
             self.settings = settings
             self.skills: list[str] = []
 
@@ -126,7 +126,7 @@ def test_chat_clear_calls_console_clear(monkeypatch, tmp_path: Path) -> None:
     clear_calls: list[bool] = []
 
     class StubRuntime:
-        def __init__(self, settings: AppSettings) -> None:
+        def __init__(self, settings: AppSettings, *args: Any, **kwargs: Any) -> None:
             self.settings = settings
             self.skills: list[str] = []
 

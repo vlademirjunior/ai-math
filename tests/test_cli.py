@@ -1,4 +1,4 @@
-﻿import json
+import json
 
 import pytest
 from typer.testing import CliRunner
@@ -50,7 +50,7 @@ def test_chat_prompt_auto_calls_pipeline(monkeypatch: pytest.MonkeyPatch) -> Non
     calls: list[tuple[str, bool]] = []
 
     class StubRuntime:
-        def __init__(self, settings: AppSettings) -> None:
+        def __init__(self, settings: AppSettings, *args, **kwargs) -> None:
             self.settings = settings
 
         def run_pipeline(
@@ -74,7 +74,7 @@ def test_role_command_routes_manual_role(monkeypatch: pytest.MonkeyPatch) -> Non
     calls: list[tuple[str, bool]] = []
 
     class StubRuntime:
-        def __init__(self, settings: AppSettings) -> None:
+        def __init__(self, settings: AppSettings, *args, **kwargs) -> None:
             self.settings = settings
 
         def run_manual_role(
@@ -95,7 +95,7 @@ def test_role_command_handles_clarification_followup(monkeypatch: pytest.MonkeyP
     prompts: list[str] = []
 
     class StubRuntime:
-        def __init__(self, settings: AppSettings) -> None:
+        def __init__(self, settings: AppSettings, *args, **kwargs) -> None:
             self.settings = settings
 
         def run_manual_role(
@@ -124,7 +124,7 @@ def test_chat_prompt_slash_routes_manual_role(monkeypatch: pytest.MonkeyPatch) -
     pipeline_calls: list[str] = []
 
     class StubRuntime:
-        def __init__(self, settings: AppSettings) -> None:
+        def __init__(self, settings: AppSettings, *args, **kwargs) -> None:
             self.settings = settings
 
         def run_manual_role(
@@ -156,7 +156,7 @@ def test_run_prompt_slash_routes_manual_role(monkeypatch: pytest.MonkeyPatch) ->
     pipeline_calls: list[str] = []
 
     class StubRuntime:
-        def __init__(self, settings: AppSettings) -> None:
+        def __init__(self, settings: AppSettings, *args, **kwargs) -> None:
             self.settings = settings
 
         def run_manual_role(
@@ -188,7 +188,7 @@ def test_chat_oi_routes_to_natural_chat(monkeypatch: pytest.MonkeyPatch) -> None
     chat_calls: list[str] = []
 
     class StubRuntime:
-        def __init__(self, settings: AppSettings) -> None:
+        def __init__(self, settings: AppSettings, *args, **kwargs) -> None:
             self.settings = settings
 
         def run_pipeline(

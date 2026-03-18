@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 
 from main import AppSettings, ModelFactory, ModelRole, Provider, RoleModelConfig
 

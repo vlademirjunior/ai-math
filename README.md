@@ -194,11 +194,17 @@ uv run python main.py chat
 # Pipeline em uma execucao
 uv run python main.py chat --prompt "Plan refactor for auth service"
 
+# Pipeline com exception handling
+uv run python main.py chat --prompt "Plan refactor for auth service" --debug
+
 # Pipeline totalmente automatico (sem HITL no implementer)
 uv run python main.py chat --prompt "Plan refactor for auth service" --auto
 
 # Pipeline com log detalhado (verbose)
 uv run python main.py chat --prompt "Plan refactor for auth service" --verbose
+
+# Pipeline com debug (stack trace de erros MCP)
+uv run python main.py chat --prompt "Plan refactor for auth service" --debug
 
 # Execucao single-shot
 uv run python main.py run "Implement tests for parser"

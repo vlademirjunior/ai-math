@@ -91,6 +91,7 @@ Assumindo binario em `./dist/deep-agents`:
 ./dist/deep-agents chat --prompt "Plan refactor for auth service"
 ./dist/deep-agents chat --prompt "Plan refactor for auth service" --auto
 ./dist/deep-agents chat --prompt "Plan refactor for auth service" --verbose
+./dist/deep-agents chat --prompt "Plan refactor for auth service" --debug
 
 # Conversa natural (sem roles)
 ./dist/deep-agents chat --prompt "oi"

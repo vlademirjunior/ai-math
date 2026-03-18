@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 
 from main import (
     IMPLEMENTER_DONE_TOKEN,

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 
@@ -123,6 +123,17 @@ def test_context_mcp_limit_is_separate(tmp_path: Path) -> None:
         def has_servers(self) -> bool:
             return True
 
+        @property
+        def cached_tools(self) -> dict[str, list[object]] | None:
+            return None
+
+        @property
+        def cached_resources(self) -> list[MCPResourceBlob] | None:
+            return None
+
+        async def refresh(self) -> None:
+            return None
+
         async def get_all_tools(self):
             return {"docs": [{"name": "search"}]}
 
@@ -156,6 +167,17 @@ def test_context_priority_order(tmp_path: Path) -> None:
     class _PriorityMCP:
         def has_servers(self) -> bool:
             return True
+
+        @property
+        def cached_tools(self) -> dict[str, list[object]] | None:
+            return None
+
+        @property
+        def cached_resources(self) -> list[MCPResourceBlob] | None:
+            return None
+
+        async def refresh(self) -> None:
+            return None
 
         async def get_all_tools(self):
             return {"docs": []}
