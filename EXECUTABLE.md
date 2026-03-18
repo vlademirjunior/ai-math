@@ -119,7 +119,13 @@ Assumindo binario em `./dist/helo`:
 
 ```bash
 uv sync
-.venv/bin/pyinstaller --onefile --name helo main.py
+.venv/bin/pyinstaller --onefile --name helo --add-data "skills_builtin:skills_builtin" main.py
+```
+
+Alternativa recomendada (usa o `helo.spec` versionado no repo):
+
+```bash
+.venv/bin/pyinstaller helo.spec
 ```
 
 Saida esperada:

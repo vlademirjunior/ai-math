@@ -5,6 +5,7 @@ from main import (
     DUMP_EVENT_PREFIX,
     IMPLEMENTER_DONE_TOKEN,
     STATUS_EVENT_PREFIX,
+    STOP_AND_COMMIT_SENTENCE,
     AgentRuntime,
     AppSettings,
     ModelRole,
@@ -110,7 +111,10 @@ def test_run_pipeline_emits_phase_status_events(monkeypatch, tmp_path: Path) -> 
             (plans_dir / "plan.md").write_text("# Plan", encoding="utf-8")
             return ["**File:** `plans/feature-x/plan.md`\n# Plan"]
         if role is ModelRole.GENERATOR:
-            (plans_dir / "implementation.md").write_text("# Implementation", encoding="utf-8")
+            (plans_dir / "implementation.md").write_text(
+                (f"# Implementation\n## Step 1\nDo work\n\n{STOP_AND_COMMIT_SENTENCE}\n"),
+                encoding="utf-8",
+            )
             return ["**File:** `plans/feature-x/implementation.md`\n# Implementation"]
         if role is ModelRole.IMPLEMENTER:
             return [f"done {IMPLEMENTER_DONE_TOKEN}"]

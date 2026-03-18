@@ -222,7 +222,7 @@ uv run python main.py run "Implement tests for parser" --verbose
 uv run python main.py role planner "Criar plano da feature XPTO"
 uv run python main.py role planner "Criar plano da feature XPTO" --no-interactive-followup
 uv run python main.py role generator "Gerar implementation guide com checkpoints"
-uv run python main.py role implementer "Executar implementation atual"
+uv run python main.py role implementer "Executar implementation /workspace/plans/url-shortener-api/implementation.md"
 uv run python main.py role implementer "Executar implementation atual" --auto
 uv run python main.py role implementer "Executar implementation atual" --verbose
 

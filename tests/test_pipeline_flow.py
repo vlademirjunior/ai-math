@@ -3,6 +3,7 @@ from pathlib import Path
 from main import (
     IMPLEMENTER_DONE_TOKEN,
     IMPLEMENTER_STOP_TOKEN,
+    STOP_AND_COMMIT_SENTENCE,
     AgentRuntime,
     AppSettings,
     ModelRole,
@@ -32,7 +33,10 @@ def test_pipeline_runs_all_phases(monkeypatch, tmp_path: Path) -> None:
             (plans_dir / "plan.md").write_text("# Plan", encoding="utf-8")
             return ["**File:** `plans/implement-feature/plan.md`\n# Plan"]
         if role is ModelRole.GENERATOR:
-            (plans_dir / "implementation.md").write_text("# Implementation", encoding="utf-8")
+            (plans_dir / "implementation.md").write_text(
+                (f"# Implementation\n## Step 1\nDo work\n\n{STOP_AND_COMMIT_SENTENCE}\n"),
+                encoding="utf-8",
+            )
             return ["**File:** `plans/implement-feature/implementation.md`\n# Implementation"]
         implementer_calls["count"] += 1
         if implementer_calls["count"] == 1:
@@ -66,7 +70,10 @@ def test_pipeline_auto_mode_runs_implementer_once(monkeypatch, tmp_path: Path) -
             (plans_dir / "plan.md").write_text("# Plan", encoding="utf-8")
             return ["**File:** `plans/implement-feature/plan.md`\n# Plan"]
         if role is ModelRole.GENERATOR:
-            (plans_dir / "implementation.md").write_text("# Implementation", encoding="utf-8")
+            (plans_dir / "implementation.md").write_text(
+                (f"# Implementation\n## Step 1\nDo work\n\n{STOP_AND_COMMIT_SENTENCE}\n"),
+                encoding="utf-8",
+            )
             return ["**File:** `plans/implement-feature/implementation.md`\n# Implementation"]
         calls.append(role)
         return ["ok"]
@@ -198,7 +205,10 @@ def test_pipeline_uses_filesystem_artifacts_even_without_output_path(
             (plans_dir / "plan.md").write_text("# Plan", encoding="utf-8")
             return ["planner done"]
         if role is ModelRole.GENERATOR:
-            (plans_dir / "implementation.md").write_text("# Implementation", encoding="utf-8")
+            (plans_dir / "implementation.md").write_text(
+                (f"# Implementation\n## Step 1\nDo work\n\n{STOP_AND_COMMIT_SENTENCE}\n"),
+                encoding="utf-8",
+            )
             return ["generator done"]
         return [f"done {IMPLEMENTER_DONE_TOKEN}"]
 
@@ -216,3 +226,78 @@ def test_pipeline_uses_filesystem_artifacts_even_without_output_path(
     names = {path.name for path in generated_files}
     assert "plan.md" in names
     assert "implementation.md" in names
+
+
+def test_pipeline_retries_generator_when_missing_stop_and_commit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runtime = AgentRuntime(_settings(tmp_path))
+    calls = {"generator": 0, "implementer": 0}
+
+    def fake_stream_role(self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False):
+        plans_dir = tmp_path / "plans" / "feature-stop"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        if role is ModelRole.PLANNER:
+            (plans_dir / "plan.md").write_text("# Plan", encoding="utf-8")
+            return ["**File:** `plans/feature-stop/plan.md`\n# Plan"]
+        if role is ModelRole.GENERATOR:
+            calls["generator"] += 1
+            if calls["generator"] == 1:
+                (plans_dir / "implementation.md").write_text(
+                    "# Guide\n## Step 1\nDo work", encoding="utf-8"
+                )
+                return ["**File:** `plans/feature-stop/implementation.md`\n# Guide"]
+            (plans_dir / "implementation.md").write_text(
+                (f"# Guide\n## Step 1\nDo work\n\n{STOP_AND_COMMIT_SENTENCE}\n"),
+                encoding="utf-8",
+            )
+            return ["**File:** `plans/feature-stop/implementation.md`\n# Guide repaired"]
+        calls["implementer"] += 1
+        return [f"done {IMPLEMENTER_DONE_TOKEN}"]
+
+    monkeypatch.setattr(AgentRuntime, "stream_role", fake_stream_role)
+
+    generated_files = runtime.run_pipeline(
+        prompt="Implement feature",
+        thread_id="thread-stop-repair",
+        auto=True,
+        request_continue=None,
+        on_chunk=None,
+    )
+
+    assert calls["generator"] == 2
+    assert calls["implementer"] == 1
+    assert any(path.name == "implementation.md" for path in generated_files)
+
+
+def test_pipeline_stops_if_generator_never_adds_stop_and_commit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runtime = AgentRuntime(_settings(tmp_path))
+    calls: list[ModelRole] = []
+
+    def fake_stream_role(self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False):
+        plans_dir = tmp_path / "plans" / "feature-stop-fail"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        calls.append(role)
+        if role is ModelRole.PLANNER:
+            (plans_dir / "plan.md").write_text("# Plan", encoding="utf-8")
+            return ["**File:** `plans/feature-stop-fail/plan.md`\n# Plan"]
+        if role is ModelRole.GENERATOR:
+            (plans_dir / "implementation.md").write_text(
+                "# Guide\n## Step 1\nDo work", encoding="utf-8"
+            )
+            return ["**File:** `plans/feature-stop-fail/implementation.md`\n# Guide"]
+        return [f"done {IMPLEMENTER_DONE_TOKEN}"]
+
+    monkeypatch.setattr(AgentRuntime, "stream_role", fake_stream_role)
+
+    runtime.run_pipeline(
+        prompt="Implement feature",
+        thread_id="thread-stop-fail",
+        auto=True,
+        request_continue=None,
+        on_chunk=None,
+    )
+
+    assert calls == [ModelRole.PLANNER, ModelRole.GENERATOR, ModelRole.GENERATOR]

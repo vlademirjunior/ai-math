@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -42,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 IMPLEMENTER_STOP_TOKEN = "STOP_FOR_COMMIT"
 IMPLEMENTER_DONE_TOKEN = "IMPLEMENTATION_COMPLETE"
+STOP_AND_COMMIT_SENTENCE = (
+    "**STOP & COMMIT:** Agent must stop here and wait for the user to test, stage, and commit "
+    "the change."
+)
 STATUS_EVENT_PREFIX = "__STATUS__::"
 DUMP_EVENT_PREFIX = "__DUMP__::"
 META_CONTEXT_WINDOW_FALLBACK = 128_000
@@ -62,6 +67,24 @@ CHAT_COMMANDS = {
 ROLE_COMMANDS = {"/planner", "/generator", "/implementer"}
 ROLE_ARGUMENT = typer.Argument(..., help="Role to execute manually: planner|generator|implementer")
 PROMPT_ARGUMENT = typer.Argument(..., help="Role prompt.")
+
+FALLBACK_BUILTIN_SKILLS: dict[str, str] = {
+    "planner": (
+        "You are the planner role. Do not write production code or edit source files. "
+        "Your mandatory artifact is plans/{feature-name}/plan.md. "
+        "Use tools to gather context, then create or update only plan.md with a concrete, "
+        "testable, ordered plan and validation checkpoints."
+    ),
+    "generator": (
+        "You are the generator role. Read plan.md and produce plans/{feature-name}/"
+        "implementation.md. Do not implement source code changes in this phase. "
+        "The implementation guide must be explicit, file-level, and checkpoint-driven."
+    ),
+    "implementer": (
+        "You are the implementer role. Read implementation.md and execute only what the "
+        "plan specifies, step by step, reporting progress and validations."
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -1420,20 +1443,53 @@ class AgentRuntime:
         self._chat_agent: Any | None = None
         self.mcp_manager = MCPManager(settings, debug=mcp_debug)
 
-    def _builtin_skill_path(self, role: ModelRole) -> Path:
+    def _builtin_skill_name(self, role: ModelRole) -> str:
         skill_name = {
             ModelRole.PLANNER: "planner_skill.md",
             ModelRole.GENERATOR: "generator_skill.md",
             ModelRole.IMPLEMENTER: "implementer_skill.md",
         }[role]
-        return self.settings.project_root / "skills_builtin" / skill_name
+        return skill_name
+
+    def _builtin_skill_paths(self, role: ModelRole) -> list[Path]:
+        skill_name = self._builtin_skill_name(role)
+        candidates: list[Path] = [self.settings.project_root / "skills_builtin" / skill_name]
+
+        module_dir = Path(__file__).resolve().parent
+        candidates.append(module_dir / "skills_builtin" / skill_name)
+
+        if getattr(sys, "frozen", False):
+            meipass = getattr(sys, "_MEIPASS", None)
+            if isinstance(meipass, str) and meipass.strip():
+                candidates.append(Path(meipass) / "skills_builtin" / skill_name)
+            candidates.append(Path(sys.executable).resolve().parent / "skills_builtin" / skill_name)
+
+        deduped: list[Path] = []
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                normalized = candidate.resolve()
+            except OSError:
+                normalized = candidate
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(candidate)
+        return deduped
+
+    @staticmethod
+    def _fallback_builtin_skill_text(role: ModelRole) -> str:
+        return FALLBACK_BUILTIN_SKILLS.get(role.value, "")
 
     def _load_builtin_skill_text(self, role: ModelRole) -> str:
-        skill_file = self._builtin_skill_path(role)
-        try:
-            return skill_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            return ""
+        for skill_file in self._builtin_skill_paths(role):
+            try:
+                text = skill_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if text:
+                return text
+        return self._fallback_builtin_skill_text(role)
 
     @staticmethod
     def _pipeline_contract() -> str:
@@ -1450,14 +1506,18 @@ class AgentRuntime:
             return (
                 "You are the planner role. Your only job is to produce a concrete, testable, and "
                 "ordered implementation plan for this repository. Do not write production code. "
-                "Include validation checkpoints so downstream phases can execute without ambiguity."
+                "Include validation checkpoints so downstream phases can execute without ambiguity. "
+                "You must create or update plans/{feature-name}/plan.md and avoid source-code edits "
+                "in this phase."
             )
         if role is ModelRole.GENERATOR:
             return (
                 "You are the generator role. Convert planner output into a complete implementation "
                 "guide with explicit steps, concrete file-level actions, "
                 "and verification criteria. "
-                "Avoid ambiguity and preserve the planner scope."
+                "Avoid ambiguity and preserve the planner scope. "
+                "You must create or update plans/{feature-name}/implementation.md and avoid source-"
+                "code edits in this phase."
             )
         return (
             "You are the implementer role. Execute the implementation guide step-by-step and "
@@ -1485,6 +1545,12 @@ class AgentRuntime:
 
     def _system_prompt_for_role(self, role: ModelRole, auto: bool) -> str:
         parts = [self._pipeline_contract(), self._role_preamble(role)]
+        if role is ModelRole.GENERATOR:
+            parts.append(
+                "GENERATOR CHECKPOINT CONTRACT: implementation.md must include a STOP & COMMIT "
+                "instruction after every implementation step. Use this exact sentence each time: "
+                f"{STOP_AND_COMMIT_SENTENCE}"
+            )
         if role is ModelRole.IMPLEMENTER:
             parts.append(self._implementer_control_rules(auto))
 
@@ -1845,6 +1911,42 @@ class AgentRuntime:
         return token in output
 
     @staticmethod
+    def _count_implementation_steps(text: str) -> int:
+        return len(re.findall(r"(?im)^\s{0,3}#{2,6}\s*step\b", text))
+
+    @staticmethod
+    def _count_stop_markers(text: str) -> int:
+        return len(re.findall(re.escape(STOP_AND_COMMIT_SENTENCE), text))
+
+    def _implementation_has_required_checkpoints(self, implementation_text: str) -> bool:
+        stop_count = self._count_stop_markers(implementation_text)
+        if stop_count == 0:
+            return False
+        step_count = self._count_implementation_steps(implementation_text)
+        if step_count == 0:
+            return stop_count >= 1
+        return stop_count >= step_count
+
+    @staticmethod
+    def _generator_repair_prompt(
+        *,
+        user_prompt: str,
+        planner_output: str,
+        invalid_implementation: str,
+    ) -> str:
+        return (
+            "Regenerate plans/{feature-name}/implementation.md. HARD REQUIREMENT: include a STOP "
+            "& COMMIT block after EVERY step. Use this exact sentence in each checkpoint:\n"
+            f"{STOP_AND_COMMIT_SENTENCE}\n\n"
+            "Do not implement source code in this phase. Only create/update implementation.md. "
+            "Preserve the original plan scope and make the guide deterministic.\n\n"
+            f"User request:\n{user_prompt}\n\n"
+            f"Planner output (fallback):\n{planner_output}\n\n"
+            "Previous invalid implementation.md content:\n"
+            f"{invalid_implementation}"
+        )
+
+    @staticmethod
     def _emit_status(on_chunk: Callable[[str], None] | None, message: str) -> None:
         if on_chunk is not None:
             on_chunk(f"{STATUS_EVENT_PREFIX}{message}")
@@ -1907,6 +2009,8 @@ class AgentRuntime:
         self._emit_status(on_chunk, "Starting generator phase")
         generator_prompt = (
             "Generate a complete implementation guide with explicit verification checkpoints. "
+            "After each step, include a STOP & COMMIT section with this exact sentence: "
+            f"{STOP_AND_COMMIT_SENTENCE} "
             "First, locate and read plans/{feature-name}/plan.md created by planner "
             "using tools. "
             "If the file is unavailable, use the planner output fallback below. "
@@ -1936,6 +2040,45 @@ class AgentRuntime:
             )
             return outputs
 
+        try:
+            implementation_text = impl_file.read_text(encoding="utf-8")
+        except OSError:
+            implementation_text = generator_output
+
+        if not self._implementation_has_required_checkpoints(implementation_text):
+            self._emit_status(
+                on_chunk,
+                "Generator output missing required STOP & COMMIT checkpoints. Retrying generator once.",
+            )
+            before_repair = self._snapshot_plan_artifacts(self.settings.project_root)
+            repaired_output = self.run_role(
+                role=ModelRole.GENERATOR,
+                prompt=self._generator_repair_prompt(
+                    user_prompt=prompt,
+                    planner_output=planner_output,
+                    invalid_implementation=implementation_text,
+                ),
+                thread_id=thread_id,
+                auto=auto,
+                on_chunk=on_chunk,
+            )
+            after_repair = self._snapshot_plan_artifacts(self.settings.project_root)
+            outputs.extend(self._collect_changed_plan_artifacts(before_repair, after_repair))
+
+            impl_file = _find_artifact("implementation.md") or impl_file
+            try:
+                implementation_text = impl_file.read_text(encoding="utf-8")
+            except OSError:
+                implementation_text = repaired_output
+
+            if not self._implementation_has_required_checkpoints(implementation_text):
+                self._emit_status(
+                    on_chunk,
+                    "Generator could not produce required STOP & COMMIT checkpoints. "
+                    "Stopping pipeline before implementer.",
+                )
+                return outputs
+
         # In non-auto mode, pause after generator so user can review implementation.md
         if not auto:
             self._emit_status(
@@ -1952,11 +2095,10 @@ class AgentRuntime:
         self._emit_status(on_chunk, "\n=== Implementer ===")
         self._emit_status(on_chunk, "Starting implementer phase")
 
-        implementation_text = generator_output
         try:
             implementation_text = impl_file.read_text(encoding="utf-8")
         except OSError:
-            pass
+            implementation_text = generator_output
 
         implementer_prompt = (
             "Execute the implementation plan below in order. Respect STOP & COMMIT checkpoints and "
@@ -2017,7 +2159,9 @@ class AgentRuntime:
                 role_prompt = (
                     "Use the existing plan.md generated by planner to produce "
                     "implementation.md in the "
-                    "same plans/{feature-name} folder.\n\n"
+                    "same plans/{feature-name} folder. "
+                    "After each step, include a STOP & COMMIT section with this exact sentence: "
+                    f"{STOP_AND_COMMIT_SENTENCE}\n\n"
                     f"User request:\n{prompt}"
                 )
             before = self._snapshot_plan_artifacts(self.settings.project_root)
@@ -2036,6 +2180,59 @@ class AgentRuntime:
                 outputs.extend(
                     self._collect_existing_output_artifacts(output, self.settings.project_root)
                 )
+
+            if role is ModelRole.GENERATOR:
+                implementation_file = next(
+                    (path for path in outputs if path.name == "implementation.md"), None
+                )
+                implementation_text = output
+                if implementation_file is not None:
+                    try:
+                        implementation_text = implementation_file.read_text(encoding="utf-8")
+                    except OSError:
+                        pass
+
+                if not self._implementation_has_required_checkpoints(implementation_text):
+                    self._emit_status(
+                        on_chunk,
+                        "Generator output missing required STOP & COMMIT checkpoints. Retrying generator once.",
+                    )
+                    repair_prompt = (
+                        "Regenerate implementation.md with a STOP & COMMIT block after EVERY step. "
+                        "Use this exact sentence each time:\n"
+                        f"{STOP_AND_COMMIT_SENTENCE}\n\n"
+                        f"Original user request:\n{prompt}\n\n"
+                        f"Previous invalid implementation.md:\n{implementation_text}"
+                    )
+                    before_repair = self._snapshot_plan_artifacts(self.settings.project_root)
+                    repair_output = self.run_role(
+                        role=role,
+                        prompt=repair_prompt,
+                        thread_id=thread_id,
+                        auto=auto,
+                        on_chunk=on_chunk,
+                    )
+                    after_repair = self._snapshot_plan_artifacts(self.settings.project_root)
+                    outputs.extend(
+                        self._collect_changed_plan_artifacts(before_repair, after_repair)
+                    )
+
+                    implementation_file = next(
+                        (path for path in outputs if path.name == "implementation.md"),
+                        implementation_file,
+                    )
+                    repaired_text = repair_output
+                    if implementation_file is not None:
+                        try:
+                            repaired_text = implementation_file.read_text(encoding="utf-8")
+                        except OSError:
+                            pass
+
+                    if not self._implementation_has_required_checkpoints(repaired_text):
+                        self._emit_status(
+                            on_chunk,
+                            "Generator still missing required STOP & COMMIT checkpoints.",
+                        )
 
             return outputs
 
