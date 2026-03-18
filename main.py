@@ -826,13 +826,13 @@ def build_contextual_prompt(
 
     if auto_load_skills and local_budget_used < MAX_CONTEXT_FILE_CHARS:
         already_loaded = set(sources)
-        block, srcs, used = _collect_intent_skill_context(
+        intent_blocks, srcs, used = _collect_intent_skill_context(
             project_root,
             MAX_CONTEXT_FILE_CHARS - local_budget_used,
             cleaned_message,
             already_loaded,
         )
-        context_blocks.extend(block)
+        context_blocks.extend(intent_blocks)
         sources.extend(srcs)
         local_budget_used += used
 
@@ -856,7 +856,9 @@ def build_contextual_prompt(
         for resource in resources:
             if mcp_chars_used >= MAX_MCP_CONTEXT_CHARS:
                 break
-            block = f"[MCP: {resource.server_name}] {resource.resource_uri}\n\n{resource.content}"
+            block: str = (
+                f"[MCP: {resource.server_name}] {resource.resource_uri}\n\n{resource.content}"
+            )
             clipped, used = _trim_to_remaining(block, MAX_MCP_CONTEXT_CHARS - mcp_chars_used)
             if used <= 0:
                 break

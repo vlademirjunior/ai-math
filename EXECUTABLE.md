@@ -1,6 +1,6 @@
-# Executavel Deep Agents
+# Executavel Helo CLI (AI)
 
-Guia para uso do binario `deep-agents` sem Python local.
+Guia para uso do binario `helo` sem Python local.
 
 ## Requisitos
 
@@ -78,53 +78,53 @@ Observacao:
 
 ## Comandos com Executavel
 
-Assumindo binario em `./dist/deep-agents`:
+Assumindo binario em `./dist/helo`:
 
 ```bash
 # Ajuda e diagnostico
-./dist/deep-agents --help
-./dist/deep-agents doctor
-./dist/deep-agents models
-./dist/deep-agents skills
+./dist/helo --help
+./dist/helo doctor
+./dist/helo models
+./dist/helo skills
 
 # Chat (pipeline)
-./dist/deep-agents chat
-./dist/deep-agents chat --prompt "Plan refactor for auth service"
-./dist/deep-agents chat --prompt "Plan refactor for auth service" --auto
-./dist/deep-agents chat --prompt "Plan refactor for auth service" --verbose
-./dist/deep-agents chat --prompt "Plan refactor for auth service" --debug
+./dist/helo chat
+./dist/helo chat --prompt "Plan refactor for auth service"
+./dist/helo chat --prompt "Plan refactor for auth service" --auto
+./dist/helo chat --prompt "Plan refactor for auth service" --verbose
+./dist/helo chat --prompt "Plan refactor for auth service" --debug
 
 # Conversa natural (sem roles)
-./dist/deep-agents chat --prompt "oi"
+./dist/helo chat --prompt "oi"
 
 # Slash command no chat
-./dist/deep-agents chat --prompt "/planner implementar feature xpto"
-./dist/deep-agents chat --prompt "/generator gerar guia de implementacao"
-./dist/deep-agents chat --prompt "/implementer executar plano atual"
+./dist/helo chat --prompt "/planner implementar feature xpto"
+./dist/helo chat --prompt "/generator gerar guia de implementacao"
+./dist/helo chat --prompt "/implementer executar plano atual"
 
 # Single-shot
-./dist/deep-agents run "Implement tests for parser"
-./dist/deep-agents run "Implement tests for parser" --auto
+./dist/helo run "Implement tests for parser"
+./dist/helo run "Implement tests for parser" --auto
 
 # Manual por role
-./dist/deep-agents role planner "Criar plano da feature XPTO"
-./dist/deep-agents role planner "Criar plano da feature XPTO" --no-interactive-followup
-./dist/deep-agents role generator "Gerar implementation guide com checkpoints"
-./dist/deep-agents role implementer "Executar implementation atual"
-./dist/deep-agents role implementer "Executar implementation atual" --auto
-./dist/deep-agents role implementer "Executar implementation atual" --verbose
+./dist/helo role planner "Criar plano da feature XPTO"
+./dist/helo role planner "Criar plano da feature XPTO" --no-interactive-followup
+./dist/helo role generator "Gerar implementation guide com checkpoints"
+./dist/helo role implementer "Executar implementation atual"
+./dist/helo role implementer "Executar implementation atual" --auto
+./dist/helo role implementer "Executar implementation atual" --verbose
 ```
 
 ## Build do Executavel
 
 ```bash
 uv sync
-.venv/bin/pyinstaller --onefile --name deep-agents main.py
+.venv/bin/pyinstaller --onefile --name helo main.py
 ```
 
 Saida esperada:
 
-- `dist/deep-agents`
+- `dist/helo`
 
 ## Lint & Typecheck (local)
 
@@ -140,7 +140,7 @@ uv run mypy --no-incremental .
 Permissao:
 
 ```bash
-chmod +x dist/deep-agents
+chmod +x dist/helo
 ```
 
 Erro de API key:
