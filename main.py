@@ -725,11 +725,69 @@ def _collect_agent_skill_context(
     return blocks, sources, consumed
 
 
+# Mapping from intent keywords to the corresponding skill directory name.
+# If the user message includes any of these keywords (word boundaries),
+# we auto-include that skill's SKILL.md into the context.
+_SKILL_INTENT_TRIGGERS: dict[str, str] = {
+    "refactor": "refactor",
+    "review": "code-review",
+}
+
+
+def _collect_intent_skill_context(
+    project_root: Path,
+    remaining_budget: int,
+    message: str,
+    already_loaded: set[str],
+) -> tuple[list[str], list[str], int]:
+    if remaining_budget <= 0:
+        return [], [], 0
+
+    # Identify which skills should be auto-loaded based on intent keywords.
+    triggers: set[str] = set()
+    message_lower = message.lower()
+    for keyword, skill_dir in _SKILL_INTENT_TRIGGERS.items():
+        # Use word boundary checks to avoid partial matches.
+        if f"{keyword}" in message_lower.split():
+            triggers.add(skill_dir)
+
+    blocks: list[str] = []
+    sources: list[str] = []
+    consumed = 0
+
+    for skill_dir in sorted(triggers):
+        skill_path = project_root / ".agents" / skill_dir / "SKILL.md"
+        if not skill_path.exists():
+            continue
+
+        rel = skill_path.relative_to(project_root).as_posix()
+        if rel in already_loaded:
+            continue
+
+        raw = _read_file_for_context(skill_path)
+        formatted = f"### {rel}\n{raw}"
+        remaining = remaining_budget - consumed
+        clipped, used = _trim_to_remaining(formatted, remaining)
+        if used <= 0:
+            break
+
+        blocks.append(clipped)
+        sources.append(rel)
+        consumed += used
+
+    return blocks, sources, consumed
+
+
 def build_contextual_prompt(
     message: str,
     project_root: Path,
     mcp_manager: MCPManagerLike | None = None,
+    auto_load_skills: bool = False,
 ) -> ContextBuildResult:
+    # Normalize to an absolute project root so relative path operations work
+    # even when callers pass a relative path like '.'
+    project_root = project_root.resolve()
+
     cleaned_message, refs = extract_context_references(message)
     warnings: list[str] = []
     sources: list[str] = []
@@ -766,14 +824,17 @@ def build_contextual_prompt(
         context_blocks.append(clipped)
         local_budget_used += used
 
-    if refs:
-        remaining_file_budget = MAX_CONTEXT_FILE_CHARS - local_budget_used
-        agent_blocks, agent_sources, agent_used = _collect_agent_skill_context(
-            project_root, remaining_file_budget
+    if auto_load_skills and local_budget_used < MAX_CONTEXT_FILE_CHARS:
+        already_loaded = set(sources)
+        block, srcs, used = _collect_intent_skill_context(
+            project_root,
+            MAX_CONTEXT_FILE_CHARS - local_budget_used,
+            cleaned_message,
+            already_loaded,
         )
-        context_blocks.extend(agent_blocks)
-        sources.extend(agent_sources)
-        local_budget_used += agent_used
+        context_blocks.extend(block)
+        sources.extend(srcs)
+        local_budget_used += used
 
     mcp_sources_used: list[str] = []
     mcp_chars_used = 0
@@ -1067,6 +1128,7 @@ class AppSettings(BaseSettings):
     project_root: Path = Field(default_factory=lambda: Path.cwd())
     thread_id_default: str = "helo-ai-cli-session"
     skills_required: bool = False
+    skills_autoload: bool = False
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
     @property
@@ -2047,6 +2109,7 @@ def chat(
             message,
             settings.project_root,
             mcp_manager=mcp_manager,
+            auto_load_skills=settings.skills_autoload,
         )
         effective_prompt = contextual.prompt
         effective_on_chunk = build_output_handler(verbose)
@@ -2060,6 +2123,7 @@ def chat(
                 role_prompt,
                 settings.project_root,
                 mcp_manager=mcp_manager,
+                auto_load_skills=settings.skills_autoload,
             )
             contextual = role_prompt_with_context
             runtime.run_manual_role(
@@ -2164,7 +2228,12 @@ def chat(
                 continue
 
             render_user_message(
-                message, build_contextual_prompt(message, settings.project_root).sources
+                message,
+                build_contextual_prompt(
+                    message,
+                    settings.project_root,
+                    auto_load_skills=settings.skills_autoload,
+                ).sources,
             )
             execute_single_message(message, current_thread_id)
             console.print()
@@ -2197,6 +2266,7 @@ def run(
             prompt,
             settings.project_root,
             mcp_manager=mcp_manager,
+            auto_load_skills=settings.skills_autoload,
         )
         if manual_role:
             role, role_prompt = manual_role

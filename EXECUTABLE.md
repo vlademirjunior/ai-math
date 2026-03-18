@@ -30,6 +30,7 @@ Opcionais:
 - `ENABLE_LANGSMITH`
 - `LANGSMITH_API_KEY`
 - `LANGSMITH_PROJECT`
+- `SKILLS_AUTOLOAD` (default: false) — quando true, carrega automaticamente skills (`.agents/*/SKILL.md`) baseando-se em keywords de intenção (ex: `refactor`, `review`).
 
 Config por role:
 

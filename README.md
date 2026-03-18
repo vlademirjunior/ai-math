@@ -127,6 +127,8 @@ Prioridade de contexto aplicada no prompt:
 
 1. Arquivos/pastas referenciados com `#context` (limite `MAX_CONTEXT_FILE_CHARS=12000`)
 2. Skills em `.agents/**/SKILL.md` (mesmo budget do item anterior)
+   - Por padrão, skills só são carregadas quando há referência explícita (`#.agents/.../SKILL.md`).
+   - Para habilitar carregamento automático por intenção (e.g. quando o prompt contém “refactor” ou “review”), use `SKILLS_AUTOLOAD=true`.
 3. Recursos MCP (limite separado `MAX_MCP_CONTEXT_CHARS=6000`)
 
 ### Autenticação de servidores MCP

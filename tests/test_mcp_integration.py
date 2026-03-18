@@ -197,9 +197,11 @@ def test_context_priority_order(tmp_path: Path) -> None:
     result = build_contextual_prompt("analisar #src.txt", tmp_path, mcp_manager=_PriorityMCP())
 
     src_index = result.prompt.index("### src.txt")
-    agents_index = result.prompt.index("### .agents/planner/SKILL.md")
     mcp_index = result.prompt.index("[MCP: docs]")
-    assert src_index < agents_index < mcp_index
+
+    # Skills should not be included unless explicitly referenced in the prompt.
+    assert "### .agents/planner/SKILL.md" not in result.prompt
+    assert src_index < mcp_index
 
 
 def test_render_mcp_status_offline_message(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

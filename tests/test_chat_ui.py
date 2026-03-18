@@ -62,6 +62,42 @@ def test_build_contextual_prompt_reads_file(tmp_path: Path) -> None:
     assert result.warnings == []
 
 
+def test_build_contextual_prompt_does_not_load_skills_unless_referenced(tmp_path: Path) -> None:
+    # Ensure skill files are not loaded just because some context is requested.
+    (tmp_path / "README.md").write_text("readme", encoding="utf-8")
+    (tmp_path / ".agents" / "code-review" / "SKILL.md").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".agents" / "code-review" / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+
+    result = build_contextual_prompt("fale sobre #README.md", tmp_path)
+
+    assert ".agents" not in ";".join(result.sources)
+    assert result.sources == ["README.md"]
+
+
+def test_build_contextual_prompt_loads_referenced_skill(tmp_path: Path) -> None:
+    skill_dir = tmp_path / ".agents" / "refactor"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+
+    result = build_contextual_prompt("use #.agents/refactor/SKILL.md", tmp_path)
+
+    assert ".agents/refactor/SKILL.md" in result.sources
+
+
+def test_build_contextual_prompt_autoloads_skill_by_intent(tmp_path: Path) -> None:
+    skill_dir = tmp_path / ".agents" / "refactor"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+
+    result = build_contextual_prompt(
+        "please refactor this code",
+        tmp_path,
+        auto_load_skills=True,
+    )
+
+    assert ".agents/refactor/SKILL.md" in result.sources
+
+
 def test_infer_context_window_uses_configured_max_tokens(tmp_path: Path) -> None:
     settings = AppSettings(
         project_root=tmp_path,
