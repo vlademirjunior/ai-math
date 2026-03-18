@@ -1851,7 +1851,11 @@ class AgentRuntime:
         if not auto:
             self._emit_status(
                 on_chunk,
-                "Pipeline paused after planner. Review plans/{feature-name}/plan.md and type 'continue' to proceed.",
+                "Pipeline paused after planner. Review plans/{feature-name}/plan.md",
+            )
+            self._emit_status(
+                on_chunk,
+                "Type 'continue' to proceed or 'stop' to exit.",
             )
             if request_continue is None or not request_continue():
                 return outputs
@@ -1883,7 +1887,11 @@ class AgentRuntime:
         if not auto:
             self._emit_status(
                 on_chunk,
-                "Pipeline paused after generator. Review plans/{feature-name}/implementation.md and type 'continue' to proceed.",
+                "Pipeline paused after generator. Review plans/{feature-name}/implementation.md",
+            )
+            self._emit_status(
+                on_chunk,
+                "Type 'continue' to proceed or 'stop' to exit.",
             )
             if request_continue is None or not request_continue():
                 return outputs
@@ -1993,7 +2001,6 @@ class AgentRuntime:
 
             return outputs
 
-        outputs: list[Path] = []
         self._emit_status(on_chunk, "\n=== Implementer ===")
         self._emit_status(on_chunk, "Starting implementer phase")
         current_prompt = (

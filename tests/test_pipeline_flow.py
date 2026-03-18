@@ -37,7 +37,7 @@ def test_pipeline_runs_all_phases(monkeypatch, tmp_path: Path) -> None:
 
     monkeypatch.setattr(AgentRuntime, "stream_role", fake_stream_role)
 
-    decisions = iter([True])
+    decisions = iter([True, True, True])
     generated_files = runtime.run_pipeline(
         prompt="Implement feature",
         thread_id="thread-1",
