@@ -60,9 +60,7 @@ CHAT_COMMANDS = {
     "/exit",
 }
 ROLE_COMMANDS = {"/planner", "/generator", "/implementer"}
-ROLE_ARGUMENT = typer.Argument(
-    ..., help="Role to execute manually: planner|generator|implementer"
-)
+ROLE_ARGUMENT = typer.Argument(..., help="Role to execute manually: planner|generator|implementer")
 PROMPT_ARGUMENT = typer.Argument(..., help="Role prompt.")
 
 
@@ -109,9 +107,7 @@ class ChatCompleter(Completer):
     def __init__(self, project_root: Path) -> None:
         self._project_root = project_root
 
-    def get_completions(
-        self, document: Document, complete_event: Any
-    ) -> Iterable[Completion]:
+    def get_completions(self, document: Document, complete_event: Any) -> Iterable[Completion]:
         del complete_event
         token = _current_input_token(document.text_before_cursor)
         if not token:
@@ -166,9 +162,7 @@ def _workspace_candidates(project_root: str) -> tuple[str, ...]:
     return tuple(sorted(candidates))
 
 
-def list_context_candidates(
-    project_root: Path, prefix: str, limit: int = 25
-) -> list[str]:
+def list_context_candidates(project_root: Path, prefix: str, limit: int = 25) -> list[str]:
     normalized_prefix = prefix.lstrip("./")
     entries = _workspace_candidates(str(project_root.resolve()))
     matches = [entry for entry in entries if entry.startswith(normalized_prefix)]
@@ -317,11 +311,7 @@ def _load_mcp_servers_from_file(config_path: Path) -> dict[str, MCPServerConfig]
                     transport,
                 ),
                 command=cast(str | None, payload.get("command")),
-                args=[
-                    str(item)
-                    for item in payload.get("args", [])
-                    if isinstance(item, str)
-                ],
+                args=[str(item) for item in payload.get("args", []) if isinstance(item, str)],
                 url=cast(str | None, payload.get("url")),
                 headers={
                     str(k): str(v)
@@ -496,9 +486,7 @@ class MCPManager:
             return self._client
         except Exception as error:
             for name in self._settings.mcp_servers:
-                self._status[name] = MCPServerStatus(
-                    online=False, last_error=str(error)
-                )
+                self._status[name] = MCPServerStatus(online=False, last_error=str(error))
                 logger.warning(
                     "MCP server '%s' is offline: %s. Continuing without MCP context.",
                     name,
@@ -801,18 +789,14 @@ def build_contextual_prompt(
 
         resources = getattr(mcp_manager, "cached_resources", None)
         if resources is None:
-            resources = cast(
-                list[MCPResourceBlob], _run_async(mcp_manager.get_resources())
-            )
+            resources = cast(list[MCPResourceBlob], _run_async(mcp_manager.get_resources()))
         mcp_resources_available = len(resources)
 
         for resource in resources:
             if mcp_chars_used >= MAX_MCP_CONTEXT_CHARS:
                 break
             block = f"[MCP: {resource.server_name}] {resource.resource_uri}\n\n{resource.content}"
-            clipped, used = _trim_to_remaining(
-                block, MAX_MCP_CONTEXT_CHARS - mcp_chars_used
-            )
+            clipped, used = _trim_to_remaining(block, MAX_MCP_CONTEXT_CHARS - mcp_chars_used)
             if used <= 0:
                 break
             context_blocks.append(clipped)
@@ -842,9 +826,7 @@ def build_contextual_prompt(
         )
 
     user_prompt = (
-        cleaned_message
-        if cleaned_message
-        else "Use o contexto anexado e responda o pedido."
+        cleaned_message if cleaned_message else "Use o contexto anexado e responda o pedido."
     )
     prompt = (
         "Contexto adicional fornecido pelo usuario via #:\n\n"
@@ -920,9 +902,7 @@ def render_chat_header(thread_id: str) -> None:
 
 def render_user_message(message: str, context_sources: list[str]) -> None:
     source_text = "\n".join(f"- {source}" for source in context_sources)
-    content = (
-        message if not context_sources else f"{message}\n\nContext refs:\n{source_text}"
-    )
+    content = message if not context_sources else f"{message}\n\nContext refs:\n{source_text}"
     timestamp = datetime.now().strftime("%H:%M:%S")
     console.print()
     console.print(
@@ -938,9 +918,7 @@ def render_user_message(message: str, context_sources: list[str]) -> None:
 
 def render_assistant_message(response: str, metadata: ChatInteractionMetadata) -> None:
     context_percent = (
-        (metadata.total_tokens / metadata.context_window) * 100
-        if metadata.context_window
-        else 0.0
+        (metadata.total_tokens / metadata.context_window) * 100 if metadata.context_window else 0.0
     )
     timestamp = datetime.now().strftime("%H:%M:%S")
     response_panel = Panel(
@@ -952,13 +930,9 @@ def render_assistant_message(response: str, metadata: ChatInteractionMetadata) -
 
     skills = "\n".join(metadata.skills_loaded) if metadata.skills_loaded else "(none)"
     sources = "\n".join(metadata.sources) if metadata.sources else "(none)"
-    mcp_sources = (
-        "\n".join(metadata.mcp_sources_used) if metadata.mcp_sources_used else "(none)"
-    )
+    mcp_sources = "\n".join(metadata.mcp_sources_used) if metadata.mcp_sources_used else "(none)"
     mcp_offline = (
-        "\n".join(metadata.mcp_servers_offline)
-        if metadata.mcp_servers_offline
-        else "(none)"
+        "\n".join(metadata.mcp_servers_offline) if metadata.mcp_servers_offline else "(none)"
     )
     meta_panel = Panel(
         Text.from_markup(
@@ -1103,10 +1077,7 @@ class AppSettings(BaseSettings):
     @model_validator(mode="after")
     def validate_provider_credentials(self) -> AppSettings:
         for role in (self.planner, self.generator, self.implementer):
-            if (
-                role.provider is Provider.OPENROUTER
-                and not self.openrouter_effective_api_key
-            ):
+            if role.provider is Provider.OPENROUTER and not self.openrouter_effective_api_key:
                 raise ValueError(
                     "openrouter_api_key or openai_api_key is required "
                     "when any role provider is openrouter"
@@ -1377,9 +1348,7 @@ class AgentRuntime:
         self.settings = settings
         self.policy = policy or OrchestrationPolicy()
         self.model_factory = ModelFactory(settings)
-        self.backend = LocalShellBackend(
-            root_dir=str(settings.project_root), virtual_mode=False
-        )
+        self.backend = LocalShellBackend(root_dir=str(settings.project_root), virtual_mode=False)
         self.skills = discover_skills_source(
             settings.project_root, required=settings.skills_required
         )
@@ -1568,9 +1537,7 @@ class AgentRuntime:
 
         lines = ["Perguntas de Clarificacao:"]
         for idx, question in enumerate(parsed_questions, start=1):
-            question_text = str(
-                question.get("question") or question.get("header") or ""
-            ).strip()
+            question_text = str(question.get("question") or question.get("header") or "").strip()
             if not question_text:
                 question_text = "Pergunta sem texto"
             lines.append(f"{idx}. {question_text}")
@@ -1578,9 +1545,7 @@ class AgentRuntime:
             options = question.get("options")
             if isinstance(options, list):
                 labels = [
-                    str(opt.get("label", "")).strip()
-                    for opt in options
-                    if isinstance(opt, dict)
+                    str(opt.get("label", "")).strip() for opt in options if isinstance(opt, dict)
                 ]
                 labels = [label for label in labels if label]
                 if labels:
@@ -1696,9 +1661,7 @@ class AgentRuntime:
         auto: bool = False,
         on_chunk: Callable[[str], None] | None = None,
     ) -> str:
-        chunks = self.stream_role(
-            role=role, prompt=prompt, thread_id=thread_id, auto=auto
-        )
+        chunks = self.stream_role(role=role, prompt=prompt, thread_id=thread_id, auto=auto)
         output_parts: list[str] = []
         for chunk in chunks:
             if on_chunk:
@@ -1899,9 +1862,7 @@ def should_trigger_pipeline(prompt: str) -> bool:
     if normalized in greetings:
         return False
 
-    if len(normalized.split()) <= 3 and any(
-        normalized.startswith(g) for g in greetings
-    ):
+    if len(normalized.split()) <= 3 and any(normalized.startswith(g) for g in greetings):
         return False
 
     keywords = (
@@ -1984,9 +1945,7 @@ def build_output_handler(
         if is_clarification_text(text):
             if state is not None:
                 state.clarification_requested = True
-            console.print(
-                Panel(text, title="Clarificacao Necessaria", border_style="yellow")
-            )
+            console.print(Panel(text, title="Clarificacao Necessaria", border_style="yellow"))
             return
         if verbose and text:
             console.print(text, end="")
@@ -2063,9 +2022,7 @@ def tracing_enabled_context(enabled: bool, project: str | None):  # type: ignore
 @app.command()
 def chat(
     prompt: str | None = typer.Option(default=None, help="Prompt to run once."),
-    thread_id: str = typer.Option(
-        default="helo-ai-cli-session", help="Thread identifier."
-    ),
+    thread_id: str = typer.Option(default="helo-ai-cli-session", help="Thread identifier."),
     auto: bool = typer.Option(
         default=False,
         help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
@@ -2181,9 +2138,7 @@ def chat(
                 continue
 
             if is_chat_command(message, "/help"):
-                console.print(
-                    Panel(parse_help_text(), title="Ajuda", border_style="bright_blue")
-                )
+                console.print(Panel(parse_help_text(), title="Ajuda", border_style="bright_blue"))
                 console.print()
                 continue
 
@@ -2218,9 +2173,7 @@ def chat(
 @app.command()
 def run(
     prompt: str = typer.Argument(..., help="Single prompt execution."),
-    thread_id: str = typer.Option(
-        default="helo-ai-cli-session", help="Thread identifier."
-    ),
+    thread_id: str = typer.Option(default="helo-ai-cli-session", help="Thread identifier."),
     auto: bool = typer.Option(
         default=False,
         help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
@@ -2282,9 +2235,7 @@ def run(
 def role_command(
     role: ModelRole = ROLE_ARGUMENT,
     prompt: str = PROMPT_ARGUMENT,
-    thread_id: str = typer.Option(
-        default="helo-ai-cli-session", help="Thread identifier."
-    ),
+    thread_id: str = typer.Option(default="helo-ai-cli-session", help="Thread identifier."),
     auto: bool = typer.Option(
         default=False,
         help="When enabled, runs implementer in fully automatic mode without manual checkpoints.",
@@ -2346,9 +2297,7 @@ def doctor() -> None:
         "openai_api_key": bool(settings.openai_api_key),
         "openrouter_effective_api_key": bool(settings.openrouter_effective_api_key),
         "dotenv_path": str(env_file) if env_file else None,
-        "skills_source": discover_skills_source(
-            settings.project_root, settings.skills_required
-        ),
+        "skills_source": discover_skills_source(settings.project_root, settings.skills_required),
         "langsmith_enabled": settings.enable_langsmith,
         "langsmith_env": os.getenv("LANGSMITH_TRACING", "false"),
         "mcp_servers_configured": sorted(settings.mcp_servers.keys()),
@@ -2374,9 +2323,7 @@ def skills(action: Annotated[str | None, typer.Argument()] = None) -> None:
 
     settings = get_settings()
     payload = {
-        "sources": discover_skills_source(
-            settings.project_root, settings.skills_required
-        ),
+        "sources": discover_skills_source(settings.project_root, settings.skills_required),
         "skills_required": settings.skills_required,
         "skills": list_skills(settings.project_root),
     }
