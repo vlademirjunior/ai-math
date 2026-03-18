@@ -143,6 +143,12 @@ Permissao:
 chmod +x dist/helo
 ```
 
+Erro ao carregar o executável (`PYI-203114: Could not load PyInstaller's embedded PKG archive`):
+
+- Esse erro normalmente indica que o binário foi corrompido/truncado durante transferência (ex: download incompleto, FTP em modo ASCII, envio por e-mail, etc.).
+- Verifique o tamanho do arquivo (`ls -l dist/helo`) e compare com o esperado.
+- Recomendado: gere o executável na máquina de destino ou transfira-o como um arquivo binário (scp/rsync/tar) para evitar corrupção.
+
 Erro de API key:
 
 - confira `OPENROUTER_API_KEY` ou `OPENAI_API_KEY`
