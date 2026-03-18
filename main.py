@@ -1665,7 +1665,11 @@ class AgentRuntime:
         slug = text.lower().strip()
         slug = slug.splitlines()[0]
         slug = re.sub(r"[^a-z0-9]+", "-", slug)
+        slug = re.sub(r"-+", "-", slug)
         slug = slug.strip("-")
+        max_len = 50
+        if len(slug) > max_len:
+            slug = slug[:max_len].rstrip("-")
         return slug or "feature"
 
     def _extract_path_from_output(self, output: str) -> Path | None:
@@ -1843,6 +1847,15 @@ class AgentRuntime:
         if plan_file is not None:
             outputs.append(plan_file)
 
+        # In non-auto mode, pause after planner so user can review plan.md
+        if not auto:
+            self._emit_status(
+                on_chunk,
+                "Pipeline paused after planner. Review plans/{feature-name}/plan.md and type 'continue' to proceed.",
+            )
+            if request_continue is None or not request_continue():
+                return outputs
+
         self._emit_status(on_chunk, "\n=== Generator ===")
         self._emit_status(on_chunk, "Starting generator phase")
         generator_prompt = (
@@ -1866,15 +1879,28 @@ class AgentRuntime:
         if impl_file is not None:
             outputs.append(impl_file)
 
+        # In non-auto mode, pause after generator so user can review implementation.md
+        if not auto:
+            self._emit_status(
+                on_chunk,
+                "Pipeline paused after generator. Review plans/{feature-name}/implementation.md and type 'continue' to proceed.",
+            )
+            if request_continue is None or not request_continue():
+                return outputs
+
         self._emit_status(on_chunk, "\n=== Implementer ===")
         self._emit_status(on_chunk, "Starting implementer phase")
 
         implementation_text = generator_output
-        if default_impl_path.exists():
-            try:
-                implementation_text = default_impl_path.read_text(encoding="utf-8")
-            except OSError:
-                pass
+        try:
+            if default_impl_path.exists():
+                try:
+                    implementation_text = default_impl_path.read_text(encoding="utf-8")
+                except OSError:
+                    pass
+        except OSError:
+            # Path may be invalid or too long. Continue using generator output.
+            pass
 
         implementer_prompt = (
             "Execute the implementation plan below in order. Respect STOP & COMMIT checkpoints and "
