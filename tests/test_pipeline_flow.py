@@ -118,6 +118,79 @@ def test_pipeline_stops_if_planner_does_not_create_plan(monkeypatch, tmp_path: P
     assert calls == [ModelRole.PLANNER]
 
 
+def test_pipeline_waits_for_clarification_before_completing_planner(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runtime = AgentRuntime(_settings(tmp_path))
+    calls: list[ModelRole] = []
+    continue_calls: list[str] = []
+    status_events: list[str] = []
+
+    def fake_stream_role(self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False):
+        del prompt, thread_id, auto
+        calls.append(role)
+        if role is ModelRole.PLANNER:
+            plans_dir = tmp_path / "plans" / "clarification"
+            plans_dir.mkdir(parents=True, exist_ok=True)
+            (plans_dir / "plan.md").write_text("# Draft plan", encoding="utf-8")
+            return ["Perguntas de Clarificacao:\n1. Qual estrategia de cache devo usar?"]
+        return ["should-not-run"]
+
+    monkeypatch.setattr(AgentRuntime, "stream_role", fake_stream_role)
+
+    def request_continue(phase: str) -> bool:
+        continue_calls.append(phase)
+        return True
+
+    runtime.run_pipeline(
+        prompt="Criar API",
+        thread_id="thread-clarification",
+        auto=False,
+        request_continue=request_continue,
+        on_chunk=lambda text: status_events.append(text),
+    )
+
+    joined = "\n".join(status_events)
+    assert calls == [ModelRole.PLANNER]
+    assert continue_calls == []
+    assert "Planner awaiting clarification. Phase not completed yet." in joined
+    assert "Planner phase completed" not in joined
+    assert "Pipeline paused after planner" not in joined
+
+
+def test_pipeline_stops_on_planner_scope_violation(monkeypatch, tmp_path: Path) -> None:
+    runtime = AgentRuntime(_settings(tmp_path))
+    calls: list[ModelRole] = []
+    status_events: list[str] = []
+
+    def fake_stream_role(self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False):
+        del prompt, thread_id, auto
+        calls.append(role)
+        if role is ModelRole.PLANNER:
+            (tmp_path / "random-root-file.md").write_text("oops", encoding="utf-8")
+            plans_dir = tmp_path / "plans" / "scoped"
+            plans_dir.mkdir(parents=True, exist_ok=True)
+            (plans_dir / "plan.md").write_text("# Plan", encoding="utf-8")
+            return ["**File:** `plans/scoped/plan.md`\n# Plan"]
+        return ["should-not-run"]
+
+    monkeypatch.setattr(AgentRuntime, "stream_role", fake_stream_role)
+
+    generated = runtime.run_pipeline(
+        prompt="Implement feature",
+        thread_id="thread-scope-violation",
+        auto=True,
+        request_continue=None,
+        on_chunk=lambda text: status_events.append(text),
+    )
+
+    joined = "\n".join(status_events)
+    assert generated == []
+    assert calls == [ModelRole.PLANNER]
+    assert "Planner changed files outside plans/{feature-name}/plan.md" in joined
+    assert "Planner scope violation: random-root-file.md" in joined
+
+
 def test_pipeline_stops_if_generator_does_not_create_implementation(
     monkeypatch, tmp_path: Path
 ) -> None:

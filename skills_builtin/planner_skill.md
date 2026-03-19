@@ -28,11 +28,11 @@ Analyze the user's request and break it down into commits:
 
 ## Step 3: Plan Generation
 
-1. Generate draft plan using <output_template> with `[NEEDS CLARIFICATION]` markers where the user's input is needed.
-2. Save the plan to "plans/{feature-name}/plan.md"
-4. Ask clarifying questions for any `[NEEDS CLARIFICATION]` sections
-5. MANDATORY: Pause for feedback
-6. If feedback received, revise plan and go back to Step 1 for any research needed
+1. Generate a PRIVATE draft plan in memory (do not write files yet) and identify unknowns.
+2. If any unknowns exist, ask clarifying questions and MANDATORY: pause for feedback.
+3. After receiving user feedback, refine the draft and go back to Step 1 for any extra research needed.
+4. Only when all clarifications are resolved, save the FINAL plan to "plans/{feature-name}/plan.md".
+5. Never mark planning complete before writing the final plan file.
 
 </workflow>
 

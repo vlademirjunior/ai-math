@@ -72,6 +72,9 @@ FALLBACK_BUILTIN_SKILLS: dict[str, str] = {
     "planner": (
         "You are the planner role. Do not write production code or edit source files. "
         "Your mandatory artifact is plans/{feature-name}/plan.md. "
+        "If clarification is needed, ask questions first and wait; do not mark the phase complete "
+        "until clarified answers are received and the final plan.md is written. "
+        "Never create files outside plans/{feature-name}/plan.md in planner phase. "
         "Use tools to gather context, then create or update only plan.md with a concrete, "
         "testable, ordered plan and validation checkpoints."
     ),
@@ -108,6 +111,16 @@ class ChatSessionMetrics:
 @dataclass
 class OutputStreamState:
     clarification_requested: bool = False
+    pipeline_started: bool = False
+    pipeline_completed: bool = False
+    pipeline_blocked: bool = False
+
+
+@dataclass(frozen=True)
+class FileSnapshot:
+    exists: bool
+    mtime_ns: int
+    size: int
 
 
 @dataclass(frozen=True)
@@ -1506,9 +1519,13 @@ class AgentRuntime:
             return (
                 "You are the planner role. Your only job is to produce a concrete, testable, and "
                 "ordered implementation plan for this repository. Do not write production code. "
-                "Include validation checkpoints so downstream phases can execute without ambiguity. "
-                "You must create or update plans/{feature-name}/plan.md and avoid source-code edits "
-                "in this phase."
+                "Include validation checkpoints so downstream phases can execute "
+                "without ambiguity. "
+                "If information is missing, ask clarification questions and wait for user answers "
+                "before finalizing the plan. "
+                "You must create or update plans/{feature-name}/plan.md and avoid "
+                "source-code edits in this phase. Never create files outside "
+                "plans/{feature-name}/plan.md."
             )
         if role is ModelRole.GENERATOR:
             return (
@@ -1824,6 +1841,54 @@ class AgentRuntime:
                 changed.append(path)
         return changed
 
+    def _snapshot_project_files(self, project_root: Path) -> dict[Path, FileSnapshot]:
+        """Capture all files under project root for phase-level scope validation."""
+
+        root = project_root.resolve()
+        snapshot: dict[Path, FileSnapshot] = {}
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            snapshot[path.resolve()] = FileSnapshot(
+                exists=True,
+                mtime_ns=stat.st_mtime_ns,
+                size=stat.st_size,
+            )
+        return snapshot
+
+    @staticmethod
+    def _collect_changed_project_files(
+        before: dict[Path, FileSnapshot],
+        after: dict[Path, FileSnapshot],
+    ) -> list[Path]:
+        changed: list[Path] = []
+        for path in sorted(after):
+            prev = before.get(path)
+            curr = after[path]
+            if prev is None:
+                changed.append(path)
+                continue
+            if prev.mtime_ns != curr.mtime_ns or prev.size != curr.size:
+                changed.append(path)
+        return changed
+
+    @staticmethod
+    def _is_allowed_planner_artifact(path: Path, project_root: Path) -> bool:
+        root = project_root.resolve()
+        try:
+            rel = path.resolve().relative_to(root)
+        except ValueError:
+            return False
+        if not rel.parts:
+            return False
+        if rel.parts[0] != "plans":
+            return False
+        return rel.name == "plan.md"
+
     def create_role_agent(self, role: ModelRole, auto: bool = False) -> Any:
         cache_key = (role, auto)
         cached = self._role_agents.get(cache_key)
@@ -1970,6 +2035,7 @@ class AgentRuntime:
 
         self._emit_status(on_chunk, "\n=== Planner ===")
         self._emit_status(on_chunk, "Starting planner phase")
+        before_planner_files = self._snapshot_project_files(self.settings.project_root)
         before_planner = self._snapshot_plan_artifacts(self.settings.project_root)
         planner_output = self.run_role(
             role=ModelRole.PLANNER,
@@ -1978,7 +2044,35 @@ class AgentRuntime:
             auto=auto,
             on_chunk=on_chunk,
         )
-        self._emit_status(on_chunk, "Planner phase completed")
+        after_planner_files = self._snapshot_project_files(self.settings.project_root)
+
+        changed_planner_files = self._collect_changed_project_files(
+            before_planner_files,
+            after_planner_files,
+        )
+        disallowed_planner_changes = [
+            path
+            for path in changed_planner_files
+            if not self._is_allowed_planner_artifact(path, self.settings.project_root)
+        ]
+        if disallowed_planner_changes:
+            self._emit_status(
+                on_chunk,
+                "Planner changed files outside plans/{feature-name}/plan.md. "
+                "Stopping pipeline before generator.",
+            )
+            if on_chunk is not None:
+                for path in disallowed_planner_changes:
+                    relative = path.resolve().relative_to(self.settings.project_root.resolve())
+                    on_chunk(f"{STATUS_EVENT_PREFIX}Planner scope violation: {relative.as_posix()}")
+            return outputs
+
+        if is_clarification_text(planner_output):
+            self._emit_status(
+                on_chunk,
+                "Planner awaiting clarification. Phase not completed yet.",
+            )
+            return outputs
 
         after_planner = self._snapshot_plan_artifacts(self.settings.project_root)
         outputs.extend(self._collect_changed_plan_artifacts(before_planner, after_planner))
@@ -1991,6 +2085,8 @@ class AgentRuntime:
                 "Stopping pipeline before generator.",
             )
             return outputs
+
+        self._emit_status(on_chunk, "Planner phase completed")
 
         # In non-auto mode, pause after planner so user can review plan.md
         if not auto:
@@ -2048,7 +2144,8 @@ class AgentRuntime:
         if not self._implementation_has_required_checkpoints(implementation_text):
             self._emit_status(
                 on_chunk,
-                "Generator output missing required STOP & COMMIT checkpoints. Retrying generator once.",
+                "Generator output missing required STOP & COMMIT checkpoints. "
+                "Retrying generator once.",
             )
             before_repair = self._snapshot_plan_artifacts(self.settings.project_root)
             repaired_output = self.run_role(
@@ -2195,7 +2292,8 @@ class AgentRuntime:
                 if not self._implementation_has_required_checkpoints(implementation_text):
                     self._emit_status(
                         on_chunk,
-                        "Generator output missing required STOP & COMMIT checkpoints. Retrying generator once.",
+                        "Generator output missing required STOP & COMMIT checkpoints. "
+                        "Retrying generator once.",
                     )
                     repair_prompt = (
                         "Regenerate implementation.md with a STOP & COMMIT block after EVERY step. "
@@ -2399,8 +2497,13 @@ def is_clarification_text(text: str) -> bool:
     hints = (
         "perguntas de clarificacao",
         "perguntas de clarificação",
+        "clarificacao necessaria",
+        "clarificação necessária",
         "clarification questions",
         "clarifying questions",
+        "clarification needed",
+        "need clarification",
+        "please provide your preferences",
     )
     return any(hint in normalized for hint in hints)
 
@@ -2411,6 +2514,21 @@ def build_output_handler(
     def handler(text: str) -> None:
         if text.startswith(STATUS_EVENT_PREFIX):
             message = text[len(STATUS_EVENT_PREFIX) :]
+            normalized_message = message.lower()
+            if state is not None:
+                if "starting planner phase" in normalized_message:
+                    state.pipeline_started = True
+                    state.pipeline_completed = False
+                    state.pipeline_blocked = False
+                if "implementer phase completed" in normalized_message:
+                    state.pipeline_completed = True
+                    state.pipeline_blocked = False
+                if "stopping pipeline before" in normalized_message:
+                    state.pipeline_blocked = True
+                    state.pipeline_completed = False
+                if "pipeline paused after" in normalized_message:
+                    state.pipeline_blocked = True
+                    state.pipeline_completed = False
             console.print(f"[bold cyan]{message}[/]")
             return
         if text.startswith(DUMP_EVENT_PREFIX):
@@ -2517,8 +2635,18 @@ def chat(
     mcp_manager = _runtime_mcp_manager(runtime)
     metrics = ChatSessionMetrics()
     context_window = infer_context_window(settings)
+    pending_pipeline_clarification = False
+
+    def _clarification_followup_prompt(answer: str) -> str:
+        return (
+            "The user is answering clarification questions from the ongoing planner phase. "
+            "Treat this message as clarification answers, incorporate them, and finish "
+            "plans/{feature-name}/plan.md before moving to the next phase.\n\n"
+            f"Clarification answers:\n{answer}"
+        )
 
     def execute_single_message(message: str, current_thread_id: str) -> str:
+        nonlocal pending_pipeline_clarification
         contextual = build_contextual_prompt(
             message,
             settings.project_root,
@@ -2526,7 +2654,8 @@ def chat(
             auto_load_skills=settings.skills_autoload,
         )
         effective_prompt = contextual.prompt
-        effective_on_chunk = build_output_handler(verbose)
+        stream_state = OutputStreamState()
+        effective_on_chunk = build_output_handler(verbose, stream_state)
         selected_role = "chat"
 
         manual_role = parse_manual_role_command(message)
@@ -2548,18 +2677,34 @@ def chat(
                 request_continue=ask_continue_after_checkpoint if not auto else None,
                 on_chunk=effective_on_chunk,
             )
+            pending_pipeline_clarification = False
             output = "Execucao de role concluida."
-        elif should_trigger_pipeline(message):
+        elif pending_pipeline_clarification or should_trigger_pipeline(message):
             selected_role = "pipeline"
+            pipeline_prompt = effective_prompt
+            if pending_pipeline_clarification:
+                pipeline_prompt = _clarification_followup_prompt(message)
             runtime.run_pipeline(
-                prompt=effective_prompt,
+                prompt=pipeline_prompt,
                 thread_id=current_thread_id,
                 auto=auto,
                 request_continue=ask_continue_after_checkpoint if not auto else None,
                 on_chunk=effective_on_chunk,
             )
-            output = "Pipeline concluido."
+            if stream_state.clarification_requested:
+                pending_pipeline_clarification = True
+                output = "Pipeline aguardando clarificacao para continuar."
+            elif stream_state.pipeline_completed:
+                pending_pipeline_clarification = False
+                output = "Pipeline concluido."
+            elif stream_state.pipeline_started and stream_state.pipeline_blocked:
+                pending_pipeline_clarification = False
+                output = "Pipeline pausado/interrompido antes da conclusao."
+            else:
+                pending_pipeline_clarification = False
+                output = "Pipeline finalizado sem conclusao completa."
         else:
+            pending_pipeline_clarification = False
             output = runtime.run_chat(
                 prompt=effective_prompt,
                 thread_id=current_thread_id,

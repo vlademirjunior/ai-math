@@ -76,6 +76,43 @@ def test_output_handler_shows_clarification_when_not_verbose(monkeypatch) -> Non
     assert printed
 
 
+def test_output_handler_detects_additional_clarification_phrases(monkeypatch) -> None:
+    printed: list[str] = []
+
+    def fake_print(*args, **kwargs) -> None:
+        if args:
+            printed.append(str(args[0]))
+
+    monkeypatch.setattr(main.console, "print", fake_print)
+
+    state = OutputStreamState()
+    handler = build_output_handler(verbose=False, state=state)
+    handler("Clarification needed: please provide your preferences.")
+
+    assert state.clarification_requested is True
+    assert printed
+
+
+def test_output_handler_tracks_pipeline_completion_status(monkeypatch) -> None:
+    printed: list[str] = []
+
+    def fake_print(*args, **kwargs) -> None:
+        if args:
+            printed.append(str(args[0]))
+
+    monkeypatch.setattr(main.console, "print", fake_print)
+
+    state = OutputStreamState()
+    handler = build_output_handler(verbose=False, state=state)
+    handler(f"{STATUS_EVENT_PREFIX}Starting planner phase")
+    handler(f"{STATUS_EVENT_PREFIX}Implementer phase completed")
+
+    assert state.pipeline_started is True
+    assert state.pipeline_completed is True
+    assert state.pipeline_blocked is False
+    assert printed
+
+
 def test_assistant_text_extracts_questions_from_tool_call() -> None:
     message = {
         "role": "assistant",

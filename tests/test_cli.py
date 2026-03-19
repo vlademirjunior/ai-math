@@ -245,3 +245,70 @@ def test_chat_oi_routes_to_natural_chat(monkeypatch: pytest.MonkeyPatch) -> None
     assert result.exit_code == 0
     assert pipeline_calls == []
     assert chat_calls == ["oi"]
+
+
+def test_chat_pipeline_clarification_followup_stays_in_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline_calls: list[str] = []
+    chat_calls: list[str] = []
+
+    class _FakePromptSession:
+        def __init__(self, messages: list[str]) -> None:
+            self._messages = messages
+            self._index = 0
+
+        def prompt(self, _message: str) -> str:
+            if self._index >= len(self._messages):
+                return "/exit"
+            value = self._messages[self._index]
+            self._index += 1
+            return value
+
+    class StubRuntime:
+        def __init__(self, settings: AppSettings, *args, **kwargs) -> None:
+            self.settings = settings
+            self._pipeline_runs = 0
+
+        def run_pipeline(
+            self, prompt: str, thread_id: str, *, auto: bool, request_continue, on_chunk
+        ) -> list:
+            del thread_id, auto, request_continue
+            self._pipeline_runs += 1
+            pipeline_calls.append(prompt)
+            if self._pipeline_runs == 1:
+                on_chunk("Perguntas de Clarificacao:\n1. Qual framework devo usar?")
+                return []
+            on_chunk(f"{main.STATUS_EVENT_PREFIX}Starting planner phase")
+            on_chunk(f"{main.STATUS_EVENT_PREFIX}Implementer phase completed")
+            return []
+
+        def run_chat(self, prompt: str, thread_id: str, on_chunk) -> str:
+            del thread_id, on_chunk
+            chat_calls.append(prompt)
+            return "chat"
+
+    monkeypatch.setattr(main, "get_settings", _litellm_settings)
+    monkeypatch.setattr(main, "AgentRuntime", StubRuntime)
+    monkeypatch.setattr(
+        main,
+        "build_chat_session_prompt",
+        lambda _root: _FakePromptSession(
+            [
+                "Crie uma API com autenticação",
+                "1. FastAPI 2. SQLAlchemy",
+                "/exit",
+            ]
+        ),
+    )
+
+    result = runner.invoke(app, ["chat"])
+
+    assert result.exit_code == 0
+    assert len(pipeline_calls) == 2
+    assert "answering clarification questions" in pipeline_calls[1].lower()
+    assert "clarification answers:" in pipeline_calls[1].lower()
+    assert "1. FastAPI 2. SQLAlchemy" in pipeline_calls[1]
+    assert chat_calls == []
+    assert result.stdout.count("Pipeline concluido.") == 1
+    assert "Pipeline aguardando clarificacao para continuar." in result.stdout

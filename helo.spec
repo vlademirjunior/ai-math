@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('skills_builtin', 'skills_builtin')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
