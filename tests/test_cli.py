@@ -107,6 +107,37 @@ def test_chat_engineering_prompt_routes_to_pipeline(monkeypatch: pytest.MonkeyPa
     assert chat_calls == []
 
 
+def test_chat_pipeline_blocked_shows_specific_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    class StubRuntime:
+        def __init__(self, settings: AppSettings, *args, **kwargs) -> None:
+            self.settings = settings
+
+        def run_pipeline(
+            self, prompt: str, thread_id: str, *, auto: bool, request_continue, on_chunk
+        ) -> list:
+            del prompt, thread_id, auto, request_continue
+            on_chunk(f"{main.STATUS_EVENT_PREFIX}Starting planner phase")
+            on_chunk(
+                f"{main.STATUS_EVENT_PREFIX}Planner failed to create plan.md even after retry. "
+                "Pipeline cannot proceed without plan.md."
+            )
+            return []
+
+        def run_chat(self, prompt: str, thread_id: str, on_chunk) -> str:
+            del prompt, thread_id, on_chunk
+            return ""
+
+    monkeypatch.setattr(main, "get_settings", _litellm_settings)
+    monkeypatch.setattr(main, "AgentRuntime", StubRuntime)
+
+    result = runner.invoke(app, ["chat", "--prompt", "Crie uma API com FastAPI e Docker"])
+
+    assert result.exit_code == 0
+    assert "Pipeline pausado/interrompido antes da conclusao:" in result.stdout
+    assert "Planner failed to create plan.md even after retry." in result.stdout
+    assert "Pipeline cannot proceed without plan.md." in result.stdout
+
+
 def test_role_command_routes_manual_role(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, bool]] = []
 
@@ -154,6 +185,25 @@ def test_role_command_handles_clarification_followup(monkeypatch: pytest.MonkeyP
     result = runner.invoke(app, ["role", "planner", "Criar plano inicial"])
     assert result.exit_code == 0
     assert prompts == ["Criar plano inicial", "Ler .vscode/settings.json"]
+
+
+def test_role_command_on_chunk_escapes_markup(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression test for Rich MarkupError when agent output contains [/?] and similar tokens.
+    class StubRuntime:
+        def __init__(self, settings: AppSettings, *args, **kwargs) -> None:
+            self.settings = settings
+
+        def run_manual_role(
+            self, role, prompt: str, thread_id: str, *, auto: bool, request_continue, on_chunk
+        ) -> list:
+            on_chunk("Este texto contem [/?] e outros colchetes [x] sem erro")
+            return []
+
+    monkeypatch.setattr(main, "get_settings", _litellm_settings)
+    monkeypatch.setattr(main, "AgentRuntime", StubRuntime)
+
+    result = runner.invoke(app, ["role", "implementer", "Executar passo 1"])
+    assert result.exit_code == 0
 
 
 def test_chat_prompt_slash_routes_manual_role(monkeypatch: pytest.MonkeyPatch) -> None:

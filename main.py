@@ -21,6 +21,7 @@ from uuid import uuid4
 import typer
 from deepagents import create_deep_agent
 from deepagents.backends import LocalShellBackend
+from langgraph.checkpoint.memory import MemorySaver
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import Completer, Completion
@@ -85,7 +86,8 @@ FALLBACK_BUILTIN_SKILLS: dict[str, str] = {
     ),
     "implementer": (
         "You are the implementer role. Read implementation.md and execute only what the "
-        "plan specifies, step by step, reporting progress and validations."
+        "plan specifies, step by step, reporting progress and validations. "
+        "CRITICAL REQUIREMENT: You MUST use edit_file to mark completed steps with [x] in implementation.md before concluding each step."
     ),
 }
 
@@ -114,6 +116,7 @@ class OutputStreamState:
     pipeline_started: bool = False
     pipeline_completed: bool = False
     pipeline_blocked: bool = False
+    pipeline_block_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1523,7 +1526,9 @@ class AgentRuntime:
                 "without ambiguity. "
                 "If information is missing, ask clarification questions and wait for user answers "
                 "before finalizing the plan. "
-                "You must create or update plans/{feature-name}/plan.md and avoid "
+                "MANDATORY: You MUST use your file-creation tools to create or update "
+                "plans/{feature-name}/plan.md. This is a hard requirement \u2014 "
+                "the pipeline WILL FAIL if this file is not created. Avoid "
                 "source-code edits in this phase. Never create files outside "
                 "plans/{feature-name}/plan.md."
             )
@@ -1538,8 +1543,9 @@ class AgentRuntime:
             )
         return (
             "You are the implementer role. Execute the implementation guide step-by-step and "
-            "report what changed and what was validated. Never run git commands; ask the user to "
-            "commit and push manually when checkpoints are reached."
+            "report what changed and what was validated. "
+            "CRITICAL REQUIREMENT: You MUST use edit_file to replace `[ ]` with `[x]` in implementation.md for each completed step before concluding it. "
+            "Never run git commands; ask the user to commit and push manually when checkpoints are reached."
         )
 
     def _implementer_control_rules(self, auto: bool) -> str:
@@ -1903,6 +1909,7 @@ class AgentRuntime:
         }
         if self.skills:
             kwargs["skills"] = self.skills
+        kwargs["checkpointer"] = MemorySaver()
         agent = create_deep_agent(**kwargs)
         self._role_agents[cache_key] = agent
         return agent
@@ -1926,6 +1933,7 @@ class AgentRuntime:
         }
         if self.skills:
             kwargs["skills"] = self.skills
+        kwargs["checkpointer"] = MemorySaver()
         self._chat_agent = create_deep_agent(**kwargs)
         return self._chat_agent
 
@@ -1962,13 +1970,19 @@ class AgentRuntime:
     ) -> str:
         chunks = self.stream_role(role=role, prompt=prompt, thread_id=thread_id, auto=auto)
         output_parts: list[str] = []
-        for chunk in chunks:
+        try:
+            for chunk in chunks:
+                if on_chunk:
+                    on_chunk(f"{DUMP_EVENT_PREFIX}{self._chunk_to_debug_dump(chunk)}")
+                text = self._chunk_to_text(chunk)
+                output_parts.append(text)
+                if on_chunk:
+                    on_chunk(text)
+        except Exception as e:
+            error_msg = f"\n[Model Execution Error: {e!r}]\n"
+            output_parts.append(error_msg)
             if on_chunk:
-                on_chunk(f"{DUMP_EVENT_PREFIX}{self._chunk_to_debug_dump(chunk)}")
-            text = self._chunk_to_text(chunk)
-            output_parts.append(text)
-            if on_chunk:
-                on_chunk(text)
+                on_chunk(error_msg)
         return "".join(output_parts)
 
     @staticmethod
@@ -2079,12 +2093,75 @@ class AgentRuntime:
 
         plan_file = _find_artifact("plan.md")
         if plan_file is None:
+            planner_text_preview = (
+                planner_output.strip()[:2000] if planner_output.strip() else "(empty)"
+            )
             self._emit_status(
                 on_chunk,
                 "Planner did not create plans/{feature-name}/plan.md. "
-                "Stopping pipeline before generator.",
+                "Retrying planner with explicit file-creation instruction.",
             )
-            return outputs
+            if on_chunk is not None:
+                on_chunk(f"{STATUS_EVENT_PREFIX}Planner output was:\n{planner_text_preview}")
+
+            retry_prompt = (
+                "CRITICAL: Your previous response did NOT create plans/{feature-name}/plan.md. "
+                "You MUST use your file-creation tools to write the plan to disk. "
+                "Create plans/{feature-name}/plan.md with the plan content NOW.\n\n"
+                f"Original request:\n{prompt}\n\n"
+                f"Your previous output:\n{planner_output}"
+            )
+            before_retry = self._snapshot_plan_artifacts(self.settings.project_root)
+            before_retry_files = self._snapshot_project_files(self.settings.project_root)
+            planner_retry_output = self.run_role(
+                role=ModelRole.PLANNER,
+                prompt=retry_prompt,
+                thread_id=thread_id,
+                auto=auto,
+                on_chunk=on_chunk,
+            )
+            after_retry_files = self._snapshot_project_files(self.settings.project_root)
+
+            changed_retry = self._collect_changed_project_files(
+                before_retry_files, after_retry_files
+            )
+            disallowed_retry = [
+                p
+                for p in changed_retry
+                if not self._is_allowed_planner_artifact(p, self.settings.project_root)
+            ]
+            if disallowed_retry:
+                self._emit_status(
+                    on_chunk,
+                    "Planner retry changed files outside plans/{feature-name}/plan.md. "
+                    "Stopping pipeline before generator.",
+                )
+                return outputs
+
+            if is_clarification_text(planner_retry_output):
+                self._emit_status(
+                    on_chunk,
+                    "Planner retry awaiting clarification. Phase not completed yet.",
+                )
+                return outputs
+
+            after_retry = self._snapshot_plan_artifacts(self.settings.project_root)
+            outputs.extend(self._collect_changed_plan_artifacts(before_retry, after_retry))
+            plan_file = _find_artifact("plan.md")
+            if plan_file is None:
+                retry_preview = (
+                    planner_retry_output.strip()[:2000]
+                    if planner_retry_output.strip()
+                    else "(empty)"
+                )
+                self._emit_status(
+                    on_chunk,
+                    "Planner failed to create plan.md even after retry. "
+                    "Pipeline cannot proceed without plan.md.",
+                )
+                if on_chunk is not None:
+                    on_chunk(f"{STATUS_EVENT_PREFIX}Planner retry output:\n{retry_preview}")
+                return outputs
 
         self._emit_status(on_chunk, "Planner phase completed")
 
@@ -2200,8 +2277,8 @@ class AgentRuntime:
         implementer_prompt = (
             "Execute the implementation plan below in order. Respect STOP & COMMIT checkpoints and "
             "report progress clearly. Read implementation.md created by previous phases "
-            "and execute "
-            "accordingly.\n\n"
+            "and execute accordingly. "
+            "CRITICAL REQUIREMENT: You MUST check off each completed step by replacing `[ ]` with `[x]` in implementation.md using edit_file.\n\n"
             f"Implementation guide:\n{implementation_text}"
         )
         step = 1
@@ -2338,8 +2415,8 @@ class AgentRuntime:
         self._emit_status(on_chunk, "Starting implementer phase")
         current_prompt = (
             "Read implementation.md generated by generator under plans/{feature-name} "
-            "and execute it "
-            "in order.\n\n"
+            "and execute it in order. "
+            "CRITICAL REQUIREMENT: You MUST use edit_file to replace `[ ]` with `[x]` in implementation.md for each completed step.\n\n"
             f"User request:\n{prompt}"
         )
         step = 1
@@ -2376,13 +2453,19 @@ class AgentRuntime:
     ) -> str:
         chunks = self.stream(prompt=prompt, thread_id=thread_id)
         parts: list[str] = []
-        for chunk in chunks:
+        try:
+            for chunk in chunks:
+                if on_chunk:
+                    on_chunk(f"{DUMP_EVENT_PREFIX}{self._chunk_to_debug_dump(chunk)}")
+                text = self._chunk_to_text(chunk)
+                parts.append(text)
+                if on_chunk:
+                    on_chunk(text)
+        except Exception as e:
+            error_msg = f"\n[Model Execution Error: {e!r}]\n"
+            parts.append(error_msg)
             if on_chunk:
-                on_chunk(f"{DUMP_EVENT_PREFIX}{self._chunk_to_debug_dump(chunk)}")
-            text = self._chunk_to_text(chunk)
-            parts.append(text)
-            if on_chunk:
-                on_chunk(text)
+                on_chunk(error_msg)
         return "".join(parts)
 
 
@@ -2520,21 +2603,29 @@ def build_output_handler(
                     state.pipeline_started = True
                     state.pipeline_completed = False
                     state.pipeline_blocked = False
+                    state.pipeline_block_reason = None
                 if "implementer phase completed" in normalized_message:
                     state.pipeline_completed = True
                     state.pipeline_blocked = False
+                    state.pipeline_block_reason = None
                 if "stopping pipeline before" in normalized_message:
                     state.pipeline_blocked = True
                     state.pipeline_completed = False
+                    state.pipeline_block_reason = message
+                if "pipeline cannot proceed" in normalized_message:
+                    state.pipeline_blocked = True
+                    state.pipeline_completed = False
+                    state.pipeline_block_reason = message
                 if "pipeline paused after" in normalized_message:
                     state.pipeline_blocked = True
                     state.pipeline_completed = False
-            console.print(f"[bold cyan]{message}[/]")
+                    state.pipeline_block_reason = message
+            console.print(message, style="bold cyan", markup=False)
             return
         if text.startswith(DUMP_EVENT_PREFIX):
             if verbose:
                 dump = text[len(DUMP_EVENT_PREFIX) :]
-                console.print(f"[dim]{dump}[/]")
+                console.print(dump, style="dim", markup=False)
             return
         if is_clarification_text(text):
             if state is not None:
@@ -2542,7 +2633,7 @@ def build_output_handler(
             console.print(Panel(text, title="Clarificacao Necessaria", border_style="yellow"))
             return
         if verbose and text:
-            console.print(text, end="")
+            console.print(text, end="", markup=False)
 
     return handler
 
@@ -2699,7 +2790,11 @@ def chat(
                 output = "Pipeline concluido."
             elif stream_state.pipeline_started and stream_state.pipeline_blocked:
                 pending_pipeline_clarification = False
-                output = "Pipeline pausado/interrompido antes da conclusao."
+                reason = stream_state.pipeline_block_reason
+                if reason:
+                    output = f"Pipeline pausado/interrompido antes da conclusao: {reason}"
+                else:
+                    output = "Pipeline pausado/interrompido antes da conclusao."
             else:
                 pending_pipeline_clarification = False
                 output = "Pipeline finalizado sem conclusao completa."

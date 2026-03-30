@@ -115,7 +115,8 @@ def test_pipeline_stops_if_planner_does_not_create_plan(monkeypatch, tmp_path: P
     )
 
     assert generated_files == []
-    assert calls == [ModelRole.PLANNER]
+    # Planner is called twice: initial attempt + retry
+    assert calls == [ModelRole.PLANNER, ModelRole.PLANNER]
 
 
 def test_pipeline_waits_for_clarification_before_completing_planner(
@@ -374,3 +375,145 @@ def test_pipeline_stops_if_generator_never_adds_stop_and_commit(
     )
 
     assert calls == [ModelRole.PLANNER, ModelRole.GENERATOR, ModelRole.GENERATOR]
+
+
+def test_pipeline_retries_planner_when_plan_not_created(monkeypatch, tmp_path: Path) -> None:
+    """Planner fails on first try but succeeds on retry — pipeline continues."""
+    runtime = AgentRuntime(_settings(tmp_path))
+    calls: list[ModelRole] = []
+
+    def fake_stream_role(self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False):
+        calls.append(role)
+        plans_dir = tmp_path / "plans" / "retry-feature"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        if role is ModelRole.PLANNER:
+            planner_count = calls.count(ModelRole.PLANNER)
+            if planner_count == 1:
+                # First attempt: no file created
+                return ["I analyzed the request but forgot to create the file."]
+            # Retry: create the file
+            (plans_dir / "plan.md").write_text("# Retry Plan", encoding="utf-8")
+            return ["**File:** `plans/retry-feature/plan.md`\n# Retry Plan"]
+        if role is ModelRole.GENERATOR:
+            (plans_dir / "implementation.md").write_text(
+                (f"# Implementation\n## Step 1\nDo work\n\n{STOP_AND_COMMIT_SENTENCE}\n"),
+                encoding="utf-8",
+            )
+            return ["**File:** `plans/retry-feature/implementation.md`\n# Implementation"]
+        return [f"done {IMPLEMENTER_DONE_TOKEN}"]
+
+    monkeypatch.setattr(AgentRuntime, "stream_role", fake_stream_role)
+
+    generated_files = runtime.run_pipeline(
+        prompt="Implement retry feature",
+        thread_id="thread-retry-success",
+        auto=True,
+        request_continue=None,
+        on_chunk=None,
+    )
+
+    assert calls.count(ModelRole.PLANNER) == 2
+    assert ModelRole.GENERATOR in calls
+    assert ModelRole.IMPLEMENTER in calls
+    names = {path.name for path in generated_files}
+    assert "plan.md" in names
+    assert "implementation.md" in names
+
+
+def test_pipeline_stops_after_planner_retry_also_fails(monkeypatch, tmp_path: Path) -> None:
+    """Both planner attempts fail — pipeline stops with detailed status messages."""
+    runtime = AgentRuntime(_settings(tmp_path))
+    calls: list[ModelRole] = []
+    status_events: list[str] = []
+
+    def fake_stream_role(self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False):
+        calls.append(role)
+        if role is ModelRole.PLANNER:
+            return ["planner-output-without-file"]
+        return ["should-not-run"]
+
+    monkeypatch.setattr(AgentRuntime, "stream_role", fake_stream_role)
+
+    generated_files = runtime.run_pipeline(
+        prompt="Implement feature",
+        thread_id="thread-retry-fail",
+        auto=True,
+        request_continue=None,
+        on_chunk=lambda text: status_events.append(text),
+    )
+
+    assert generated_files == []
+    assert calls == [ModelRole.PLANNER, ModelRole.PLANNER]
+    joined = "\n".join(status_events)
+    assert "Retrying planner" in joined
+    assert "Planner output was:" in joined
+    assert "Planner failed to create plan.md even after retry" in joined
+    assert "Pipeline cannot proceed without plan.md" in joined
+
+
+def test_pipeline_planner_retry_respects_scope_check(monkeypatch, tmp_path: Path) -> None:
+    """Planner retry that creates files outside scope is stopped."""
+    runtime = AgentRuntime(_settings(tmp_path))
+    calls: list[ModelRole] = []
+    status_events: list[str] = []
+
+    def fake_stream_role(self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False):
+        calls.append(role)
+        if role is ModelRole.PLANNER:
+            planner_count = calls.count(ModelRole.PLANNER)
+            if planner_count == 1:
+                return ["no file created"]
+            # Retry: create file outside allowed scope
+            (tmp_path / "rogue-file.md").write_text("oops", encoding="utf-8")
+            plans_dir = tmp_path / "plans" / "scoped"
+            plans_dir.mkdir(parents=True, exist_ok=True)
+            (plans_dir / "plan.md").write_text("# Plan", encoding="utf-8")
+            return ["**File:** `plans/scoped/plan.md`\n# Plan"]
+        return ["should-not-run"]
+
+    monkeypatch.setattr(AgentRuntime, "stream_role", fake_stream_role)
+
+    generated = runtime.run_pipeline(
+        prompt="Implement feature",
+        thread_id="thread-retry-scope",
+        auto=True,
+        request_continue=None,
+        on_chunk=lambda text: status_events.append(text),
+    )
+
+    joined = "\n".join(status_events)
+    assert generated == []
+    assert calls == [ModelRole.PLANNER, ModelRole.PLANNER]
+    assert "Planner retry changed files outside" in joined
+
+
+def test_pipeline_planner_retry_handles_clarification(monkeypatch, tmp_path: Path) -> None:
+    """Planner retry output contains clarification text — pipeline correctly pauses."""
+    runtime = AgentRuntime(_settings(tmp_path))
+    calls: list[ModelRole] = []
+    status_events: list[str] = []
+
+    def fake_stream_role(self, role: ModelRole, prompt: str, thread_id: str, auto: bool = False):
+        calls.append(role)
+        if role is ModelRole.PLANNER:
+            planner_count = calls.count(ModelRole.PLANNER)
+            if planner_count == 1:
+                return ["no file created"]
+            # Retry: asks for clarification instead of creating file
+            return ["Perguntas de Clarificacao:\n1. Qual banco de dados devo usar?"]
+        return ["should-not-run"]
+
+    monkeypatch.setattr(AgentRuntime, "stream_role", fake_stream_role)
+
+    generated = runtime.run_pipeline(
+        prompt="Criar API",
+        thread_id="thread-retry-clarification",
+        auto=False,
+        request_continue=lambda _phase: True,
+        on_chunk=lambda text: status_events.append(text),
+    )
+
+    joined = "\n".join(status_events)
+    assert generated == []
+    assert calls == [ModelRole.PLANNER, ModelRole.PLANNER]
+    assert "Planner retry awaiting clarification" in joined

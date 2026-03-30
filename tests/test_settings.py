@@ -48,7 +48,9 @@ def test_settings_env_parse(
     assert settings.planner.provider == expected_provider
 
 
-def test_openrouter_requires_key(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openrouter_requires_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").touch()
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("PLANNER__PROVIDER", "openrouter")
@@ -56,7 +58,7 @@ def test_openrouter_requires_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("IMPLEMENTER__PROVIDER", "ollama")
 
     with pytest.raises(ValidationError):
-        AppSettings(project_root=Path.cwd())
+        AppSettings(project_root=tmp_path)
 
 
 def test_model_only_env_defaults_provider_to_openrouter(
@@ -75,8 +77,10 @@ def test_model_only_env_defaults_provider_to_openrouter(
 
 
 def test_openai_api_key_works_as_openrouter_fallback(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").touch()
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("PLANNER__PROVIDER", "openrouter")
@@ -86,7 +90,7 @@ def test_openai_api_key_works_as_openrouter_fallback(
     monkeypatch.setenv("IMPLEMENTER__PROVIDER", "openrouter")
     monkeypatch.setenv("IMPLEMENTER__MODEL", "stepfun/step-3.5-flash:free")
 
-    settings = AppSettings(project_root=Path.cwd())
+    settings = AppSettings(project_root=tmp_path)
 
     assert settings.openrouter_effective_api_key == "test-key"
 

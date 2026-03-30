@@ -114,7 +114,7 @@ Assumindo binario em `./dist/helo`:
 ./dist/helo role implementer "Executar implementation atual" --auto
 ./dist/helo role implementer "Executar implementation atual" --verbose
 ```
-
+    
 ## Build do Executavel
 
 ```bash

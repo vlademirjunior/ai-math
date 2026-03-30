@@ -59,6 +59,44 @@ def test_output_handler_shows_dump_when_verbose(monkeypatch) -> None:
     assert any("messages" in item for item in printed)
 
 
+def test_output_handler_handles_markup_error_in_dump(monkeypatch) -> None:
+    printed: list[str] = []
+
+    def fake_print(*args, **kwargs) -> None:
+        if args:
+            printed.append(str(args[0]))
+        # Ensure markup=False is passed
+        assert kwargs.get("markup") is False
+        assert kwargs.get("style") == "dim"
+
+    monkeypatch.setattr(main.console, "print", fake_print)
+
+    handler = build_output_handler(verbose=True)
+    # This should not raise any MarkupError since we mocked print
+    handler(f"{DUMP_EVENT_PREFIX}[/] some unclosed tag [test]")
+
+    assert any("[/]" in item for item in printed)
+
+
+def test_output_handler_handles_markup_error_in_status(monkeypatch) -> None:
+    printed: list[str] = []
+
+    def fake_print(*args, **kwargs) -> None:
+        if args:
+            printed.append(str(args[0]))
+        assert kwargs.get("markup") is False
+        assert kwargs.get("style") == "bold cyan"
+
+    monkeypatch.setattr(main.console, "print", fake_print)
+
+    state = OutputStreamState()
+    handler = build_output_handler(verbose=False, state=state)
+    handler(f"{STATUS_EVENT_PREFIX}[/] invalid tag [bold]")
+
+    assert any("[/]" in item for item in printed)
+
+
+
 def test_output_handler_shows_clarification_when_not_verbose(monkeypatch) -> None:
     printed: list[str] = []
 
@@ -110,6 +148,34 @@ def test_output_handler_tracks_pipeline_completion_status(monkeypatch) -> None:
     assert state.pipeline_started is True
     assert state.pipeline_completed is True
     assert state.pipeline_blocked is False
+    assert state.pipeline_block_reason is None
+    assert printed
+
+
+def test_output_handler_tracks_pipeline_block_reason(monkeypatch) -> None:
+    printed: list[str] = []
+
+    def fake_print(*args, **kwargs) -> None:
+        if args:
+            printed.append(str(args[0]))
+
+    monkeypatch.setattr(main.console, "print", fake_print)
+
+    state = OutputStreamState()
+    handler = build_output_handler(verbose=False, state=state)
+    handler(f"{STATUS_EVENT_PREFIX}Starting planner phase")
+    handler(
+        f"{STATUS_EVENT_PREFIX}Planner failed to create plan.md even after retry. "
+        "Pipeline cannot proceed without plan.md."
+    )
+
+    assert state.pipeline_started is True
+    assert state.pipeline_completed is False
+    assert state.pipeline_blocked is True
+    assert (
+        state.pipeline_block_reason == "Planner failed to create plan.md even after retry. "
+        "Pipeline cannot proceed without plan.md."
+    )
     assert printed
 
 
